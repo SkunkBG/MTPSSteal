@@ -86,10 +86,9 @@ apt update -qq > /dev/null 2>&1
 apt install -y python3 python3-pip git curl dnsutils ufw > /dev/null 2>&1
 
 # ── Генерация секрета ──────────────────────────────────────
-RAW_SECRET=$(python3 -c "import os; print(os.urandom(16).hex())")
-# faketls-секрет = "ee" + домен в hex
-DOMAIN_HEX=$(python3 -c "import binascii; print(binascii.hexlify(b'${DOMAIN}').decode())")
-FAKETLS_SECRET="ee${DOMAIN_HEX}"
+# faketls-секрет = "ee" + 16 случайных байт в hex (итого 34 символа)
+# Домен маскировки задаётся отдельно через TLS_DOMAIN в config.py
+FAKETLS_SECRET="ee$(python3 -c "import os; print(os.urandom(16).hex())")"
 echo -e "${GREEN}[✓] Секрет сгенерирован${NC}"
 
 # ── Установка mtprotoproxy ─────────────────────────────────
@@ -245,7 +244,7 @@ Requires=caddy.service
 
 [Service]
 Type=simple
-User=nobody
+User=root
 WorkingDirectory=${PROXY_DIR}
 ExecStart=/usr/bin/python3 ${PROXY_DIR}/mtprotoproxy.py
 Restart=always
