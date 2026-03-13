@@ -53,7 +53,7 @@ bash setup.sh
 1. Проверяет DNS — домен должен вести на сервер
 2. Устанавливает зависимости (`python3`, `git`, `curl`, `ufw`)
 3. Клонирует [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) (ветка `stable`) в `/opt/mtprotoproxy`
-4. Генерирует FakeTLS-секрет: `ee` + 16 случайных байт + домен в hex
+4. Генерирует FakeTLS-секрет: 32-hex ключ для `config.py` + полная ссылка `ee` + ключ + домен для клиента
 5. Настраивает `config.py` с `MASK = True` → Caddy на `127.0.0.1:8443`
 6. Устанавливает [Caddy](https://caddyserver.com/) и получает TLS-сертификат (Let's Encrypt)
 7. Создаёт маскировочную страницу в `/var/www/html/`
@@ -152,17 +152,22 @@ curl -sk https://localhost:8443 | head -5
 
 **Обновить секрет:**
 ```bash
-# Сгенерировать новый
+# Сгенерировать новый ключ (32 hex символа)
 NEW_KEY=$(python3 -c "import os; print(os.urandom(16).hex())")
-DOMAIN_HEX=$(python3 -c "print('example.com'.encode().hex())")  # замени на свой домен
-echo "Новый секрет: ee${NEW_KEY}${DOMAIN_HEX}"
+DOMAIN="example.com"  # замени на свой домен
+DOMAIN_HEX=$(python3 -c "print('${DOMAIN}'.encode().hex())")
 
-# Вставить в конфиг
+echo "Ключ для config.py USERS: ${NEW_KEY}"
+echo "Ссылка для клиента: ee${NEW_KEY}${DOMAIN_HEX}"
+
+# Вставить ТОЛЬКО ключ (32 hex) в USERS
 nano /opt/mtprotoproxy/config.py
 
 # Перезапустить
 systemctl restart mtprotoproxy
 ```
+
+> **Важно:** в `USERS` хранится только 32-hex ключ (`NEW_KEY`). Полный секрет с `ee` + домен — только в ссылке для клиента.
 
 ## Удаление
 

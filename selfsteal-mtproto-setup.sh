@@ -85,6 +85,7 @@ fi
 echo -e "${CYAN}[*] Устанавливаю зависимости...${NC}"
 apt update -qq > /dev/null 2>&1
 apt install -y python3 python3-pip git curl dnsutils ufw > /dev/null 2>&1
+pip install cryptography --break-system-packages > /dev/null 2>&1 || true
 
 # ── Генерация секрета ──────────────────────────────────────
 # FakeTLS-секрет для Telegram = "ee" + 16 случайных байт (hex) + домен в hex
@@ -117,9 +118,10 @@ cat > "${PROXY_DIR}/config.py" << PYEOF
 PORT = 443
 
 # Пользователи и их секреты
-# Секрет начинается на "ee" = режим faketls (автоматически)
+# ВАЖНО: в USERS — только 32 hex символа (сырой ключ)
+# ee-префикс и домен добавляются автоматически для клиента
 USERS = {
-    "user1": "${FAKETLS_SECRET}",
+    "user1": "${RANDOM_KEY}",
 }
 
 # Домен маскировки — влияет на стартовое сообщение в логах
