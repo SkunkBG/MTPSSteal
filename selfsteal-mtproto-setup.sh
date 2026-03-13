@@ -1,16 +1,15 @@
 #!/bin/bash
 
 # ============================================================
-#  MTProto SelfSteal Installer v2
-#  Telegram MTProto Proxy + Caddy (маскировка под свой домен)
+#  MTProto SelfSteal Installer v3
+#  Telegram MTProto Proxy + nginx (маскировка под свой домен)
 #
 #  Архитектура:
 #    Port 443  → mtprotoproxy (faketls)
 #                  ├─ MTProto клиент → туннель в Telegram
-#                  └─ DPI / сканер   → Caddy:8443 (127.0.0.1)
-#                                          └─ реальный сайт + валидный TLS
-#    Port 80   → Caddy (ACME + страница в браузере)
-#    Port 8443 → Caddy HTTPS (только localhost, для маскировки)
+#                  └─ DPI / сканер   → nginx:8443 (127.0.0.1)
+#                                          └─ реальный сайт + TLS 1.3
+#    Port 80   → nginx (HTML-страница + ACME challenge)
 #
 #  Требования: Debian/Ubuntu, root, домен с A-записью на сервер
 # ============================================================
@@ -28,8 +27,8 @@ NC='\033[0m'
 echo -e "${CYAN}"
 cat << 'BANNER'
  ╔══════════════════════════════════════════════════════════╗
- ║       MTProto SelfSteal Installer  v2                   ║
- ║       Telegram прокси под маскировкой своего домена      ║
+ ║       MTProto SelfSteal Installer  v3                   ║
+ ║       Telegram прокси + nginx (маскировка домена)        ║
  ╚══════════════════════════════════════════════════════════╝
 BANNER
 echo -e "${NC}"
@@ -84,12 +83,12 @@ fi
 # ── Зависимости ───────────────────────────────────────────
 echo -e "${CYAN}[*] Устанавливаю зависимости...${NC}"
 apt update -qq > /dev/null 2>&1
-apt install -y python3 python3-pip git curl dnsutils ufw > /dev/null 2>&1
+apt install -y python3 python3-pip git curl dnsutils ufw nginx certbot python3-certbot-nginx > /dev/null 2>&1
 pip install cryptography --break-system-packages > /dev/null 2>&1 || true
 
 # ── Генерация секрета ──────────────────────────────────────
-# FakeTLS-секрет для Telegram = "ee" + 16 случайных байт (hex) + домен в hex
-# Клиент читает домен из секрета и ставит его в SNI поле TLS ClientHello
+# В config.py → только 32-hex ключ (RANDOM_KEY)
+# Для клиента → "ee" + ключ + домен_hex (FAKETLS_SECRET)
 RANDOM_KEY=$(python3 -c "import os; print(os.urandom(16).hex())")
 DOMAIN_HEX=$(python3 -c "print('${DOMAIN}'.encode().hex())")
 FAKETLS_SECRET="ee${RANDOM_KEY}${DOMAIN_HEX}"
@@ -108,51 +107,6 @@ else
     git clone -q -b stable https://github.com/alexbers/mtprotoproxy.git "$PROXY_DIR"
 fi
 echo -e "${GREEN}[✓] mtprotoproxy готов (stable)${NC}"
-
-# ── Конфиг mtprotoproxy ────────────────────────────────────
-cat > "${PROXY_DIR}/config.py" << PYEOF
-# ── MTProto SelfSteal Config ────────────────────────────────
-# Сгенерировано selfsteal-mtproto-setup.sh v2
-
-# Порт прокси (443 = максимальная скрытность)
-PORT = 443
-
-# Пользователи и их секреты
-# ВАЖНО: в USERS — только 32 hex символа (сырой ключ)
-# ee-префикс и домен добавляются автоматически для клиента
-USERS = {
-    "user1": "${RANDOM_KEY}",
-}
-
-# Домен маскировки — влияет на стартовое сообщение в логах
-# Реальный домен для SNI берётся клиентом из секрета
-TLS_DOMAIN = "${DOMAIN}"
-
-# ── SelfSteal: маскировка под свой сайт ─────────────────────
-# Когда DPI/сканер подключается без MTProto-хендшейка,
-# mtprotoproxy пробрасывает соединение на MASK_HOST:MASK_PORT
-# Caddy на 8443 отдаёт реальную HTML-страницу с валидным TLS
-MASK = True
-MASK_HOST = "127.0.0.1"
-MASK_PORT = 8443
-PYEOF
-
-echo -e "${GREEN}[✓] Конфиг mtprotoproxy создан${NC}"
-
-# ── Установка Caddy ───────────────────────────────────────
-echo -e "${CYAN}[*] Устанавливаю Caddy...${NC}"
-if ! command -v caddy &>/dev/null; then
-    apt install -y debian-keyring debian-archive-keyring apt-transport-https > /dev/null 2>&1
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-        | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
-    apt update -qq > /dev/null 2>&1
-    apt install -y caddy > /dev/null 2>&1
-fi
-command -v caddy &>/dev/null \
-    && echo -e "${GREEN}[✓] Caddy готов ($(caddy version 2>/dev/null | awk '{print $1}'))${NC}" \
-    || { echo -e "${RED}[✗] Caddy не установился${NC}"; exit 1; }
 
 # ── Stub-страницы ─────────────────────────────────────────
 mkdir -p /var/www/html
@@ -196,54 +150,165 @@ case "$STUB_CHOICE" in
 esac
 echo -e "${GREEN}[✓] Stub-страница создана${NC}"
 
-# ── Caddyfile ──────────────────────────────────────────────
-echo -e "${CYAN}[*] Настраиваю Caddy...${NC}"
-[[ -f /etc/caddy/Caddyfile ]] && \
-    cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)"
+# ── Останавливаем Caddy если был ───────────────────────────
+if systemctl is-active --quiet caddy 2>/dev/null; then
+    echo -e "${YELLOW}[!] Caddy обнаружен, останавливаю и отключаю...${NC}"
+    systemctl stop caddy
+    systemctl disable caddy > /dev/null 2>&1 || true
+fi
 
-cat > /etc/caddy/Caddyfile << CADDYEOF
-{
-    email admin@${DOMAIN}
+# ── nginx: начальная конфигурация (HTTP only, для certbot) ─
+echo -e "${CYAN}[*] Настраиваю nginx...${NC}"
+
+# Убираем дефолтный сайт
+rm -f /etc/nginx/sites-enabled/default
+
+cat > /etc/nginx/sites-available/selfsteal << NGEOF
+# Временный HTTP — для получения сертификата certbot
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    root /var/www/html;
+    index index.html;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        try_files \$uri /index.html;
+    }
+}
+NGEOF
+
+ln -sf /etc/nginx/sites-available/selfsteal /etc/nginx/sites-enabled/selfsteal
+nginx -t > /dev/null 2>&1 || { echo -e "${RED}[✗] Ошибка конфигурации nginx${NC}"; exit 1; }
+systemctl enable nginx > /dev/null 2>&1
+systemctl restart nginx
+echo -e "${GREEN}[✓] nginx запущен (HTTP)${NC}"
+
+# ── Получаем сертификат через certbot ──────────────────────
+echo -e "${CYAN}[*] Получаю TLS-сертификат (Let's Encrypt)...${NC}"
+certbot certonly --nginx \
+    -d "${DOMAIN}" \
+    --non-interactive \
+    --agree-tos \
+    --register-unsafely-without-email \
+    --quiet 2>/dev/null
+
+CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+
+if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
+    echo -e "${GREEN}[✓] Сертификат получен${NC}"
+else
+    echo -e "${RED}[✗] Не удалось получить сертификат!${NC}"
+    echo -e "${YELLOW}    Убедись что порт 80 открыт и DNS ведёт на сервер${NC}"
+    echo -e "${YELLOW}    Попробуй вручную: certbot certonly --nginx -d ${DOMAIN}${NC}"
+    exit 1
+fi
+
+# ── nginx: полная конфигурация (HTTP + HTTPS localhost) ────
+cat > /etc/nginx/sites-available/selfsteal << NGEOF
+# Публичный HTTP — страница + ACME challenge для обновления сертификата
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    root /var/www/html;
+    index index.html;
+
+    # ACME challenge для certbot
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        try_files \$uri /index.html;
+    }
+
+    # Убираем заголовок Server
+    server_tokens off;
+    add_header X-Content-Type-Options "nosniff" always;
 }
 
-# Публичный HTTP — страница в браузере + ACME для получения сертификата
-${DOMAIN}:80 {
-    header {
-        -Server
-        X-Content-Type-Options "nosniff"
+# Внутренний HTTPS — маскировка для mtprotoproxy (ТОЛЬКО localhost)
+# DPI/сканер → mtprotoproxy → сюда → видит валидный TLS 1.3 + HTML
+server {
+    listen 127.0.0.1:8443 ssl;
+    server_name ${DOMAIN};
+
+    ssl_certificate     ${CERT_PATH};
+    ssl_certificate_key ${KEY_PATH};
+
+    # Строго TLS 1.3 — чистый хендшейк без лишних записей
+    ssl_protocols       TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    root /var/www/html;
+    index index.html;
+
+    location / {
+        try_files \$uri /index.html;
     }
-    root * /var/www/html
-    try_files {path} /index.html
-    file_server
+
+    server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+NGEOF
+
+nginx -t > /dev/null 2>&1 || { echo -e "${RED}[✗] Ошибка конфигурации nginx${NC}"; exit 1; }
+systemctl reload nginx
+echo -e "${GREEN}[✓] nginx настроен (HTTP + HTTPS localhost)${NC}"
+
+# ── Автообновление сертификата ─────────────────────────────
+# certbot ставит cron/timer автоматически, но добавим перезапуск mtprotoproxy
+cat > /etc/letsencrypt/renewal-hooks/post/restart-services.sh << 'HOOKEOF'
+#!/bin/bash
+systemctl reload nginx
+systemctl restart mtprotoproxy
+HOOKEOF
+chmod +x /etc/letsencrypt/renewal-hooks/post/restart-services.sh
+echo -e "${GREEN}[✓] Автообновление сертификата настроено${NC}"
+
+# ── Конфиг mtprotoproxy ────────────────────────────────────
+cat > "${PROXY_DIR}/config.py" << PYEOF
+# ── MTProto SelfSteal Config v3 ─────────────────────────────
+# Сгенерировано selfsteal-mtproto-setup.sh v3
+
+# Порт прокси (443 = максимальная скрытность)
+PORT = 443
+
+# Пользователи и их секреты
+# ВАЖНО: в USERS — только 32 hex символа (сырой ключ)
+# Клиент получает полный секрет: ee + ключ + домен_hex
+USERS = {
+    "user1": "${RANDOM_KEY}",
 }
 
-# Внутренний HTTPS — для маскировки (mtprotoproxy → сюда при TLS-пробе от DPI)
-# Только localhost! DPI видит валидный TLS-сертификат и реальную HTML-страницу
-${DOMAIN}:8443 {
-    bind 127.0.0.1
-    tls {
-        protocols tls1.2 tls1.3
-    }
-    header {
-        -Server
-        X-Content-Type-Options "nosniff"
-    }
-    root * /var/www/html
-    try_files {path} /index.html
-    file_server
-}
-CADDYEOF
+# Домен маскировки
+TLS_DOMAIN = "${DOMAIN}"
 
-caddy fmt --overwrite /etc/caddy/Caddyfile > /dev/null 2>&1 || true
-echo -e "${GREEN}[✓] Caddyfile готов${NC}"
+# SelfSteal: маскировка под свой сайт
+# DPI/сканер → mtprotoproxy → nginx:8443 (TLS 1.3 + реальная HTML-страница)
+MASK = True
+MASK_HOST = "127.0.0.1"
+MASK_PORT = 8443
+PYEOF
+
+echo -e "${GREEN}[✓] Конфиг mtprotoproxy создан${NC}"
 
 # ── systemd: mtprotoproxy ──────────────────────────────────
 echo -e "${CYAN}[*] Создаю systemd-юнит для mtprotoproxy...${NC}"
 cat > /etc/systemd/system/mtprotoproxy.service << SVCEOF
 [Unit]
 Description=MTProto Proxy for Telegram (SelfSteal)
-After=network.target caddy.service
-Requires=caddy.service
+After=network.target nginx.service
+Requires=nginx.service
 
 [Service]
 Type=simple
@@ -271,24 +336,10 @@ if command -v ufw &>/dev/null; then
     echo -e "${GREEN}[✓] UFW: 80, 443 открыты | 8443 только localhost${NC}"
 fi
 
-# ── Запуск ─────────────────────────────────────────────────
-echo -e "${CYAN}[*] Запускаю Caddy (получаю сертификат)...${NC}"
-systemctl enable caddy > /dev/null 2>&1
-systemctl restart caddy
-sleep 5
-
-# Проверяем что Caddy получил сертификат и слушает 8443
-if systemctl is-active --quiet caddy; then
-    echo -e "${GREEN}[✓] Caddy запущен${NC}"
-else
-    echo -e "${RED}[✗] Caddy не запустился!${NC}"
-    echo -e "${YELLOW}    Проверь: journalctl -u caddy -n 30${NC}"
-    echo -e "${YELLOW}    Убедись что порт 80 открыт и DNS ведёт на сервер${NC}"
-fi
-
+# ── Запуск mtprotoproxy ────────────────────────────────────
 echo -e "${CYAN}[*] Запускаю mtprotoproxy...${NC}"
 systemctl enable mtprotoproxy > /dev/null 2>&1
-systemctl start mtprotoproxy
+systemctl restart mtprotoproxy
 sleep 3
 
 if systemctl is-active --quiet mtprotoproxy; then
@@ -298,18 +349,32 @@ else
     echo -e "${YELLOW}    Проверь: journalctl -u mtprotoproxy -n 30${NC}"
 fi
 
+# ── Проверка логов ────────────────────────────────────────
+PROXY_LOG=$(journalctl -u mtprotoproxy --no-pager -n 10 2>/dev/null)
+
+if echo "$PROXY_LOG" | grep -q "Bad secret"; then
+    echo -e "${RED}[✗] Ошибка секрета — проверь journalctl -u mtprotoproxy${NC}"
+elif echo "$PROXY_LOG" | grep -q "TLS record before certificate"; then
+    echo -e "${YELLOW}[!] Предупреждение: TLS record before certificate (некритично)${NC}"
+fi
+
+if echo "$PROXY_LOG" | grep -q "Got cert from the MASK_HOST"; then
+    echo -e "${GREEN}[✓] Маскировка работает — сертификат получен от nginx${NC}"
+fi
+
 # ── Ссылка для подключения ────────────────────────────────
 TG_LINK="https://t.me/proxy?server=${DOMAIN}&port=443&secret=${FAKETLS_SECRET}"
 
 # ── Итог ───────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║         ✓  MTProto SelfSteal готов!                      ║${NC}"
+echo -e "${GREEN}║         ✓  MTProto SelfSteal v3 готов!                   ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}Домен:${NC}          ${CYAN}${DOMAIN}${NC}"
 echo -e "  ${BOLD}IP сервера:${NC}     ${CYAN}${SERVER_IP}${NC}"
 echo -e "  ${BOLD}Маскировка:${NC}     ${CYAN}${STUB_NAMES[$((STUB_CHOICE-1))]}${NC}"
+echo -e "  ${BOLD}Веб-сервер:${NC}     ${CYAN}nginx + certbot${NC}"
 echo ""
 echo -e "  ${YELLOW}━━━  Ссылка для Telegram  ━━━${NC}"
 echo ""
@@ -322,20 +387,21 @@ echo -e "  ${CYAN}${FAKETLS_SECRET}${NC}"
 echo ""
 echo -e "  ${YELLOW}━━━  Порты  ━━━${NC}"
 echo ""
-echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + faketls маскировка)"
-echo -e "  ${BOLD}80${NC}    → Caddy (страница в браузере + ACME-сертификат)"
-echo -e "  ${BOLD}8443${NC}  → Caddy HTTPS (только 127.0.0.1 — TLS-проба от DPI)"
+echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + FakeTLS маскировка)"
+echo -e "  ${BOLD}80${NC}    → nginx (HTML-страница + ACME challenge)"
+echo -e "  ${BOLD}8443${NC}  → nginx HTTPS (только 127.0.0.1 — TLS 1.3 для DPI)"
 echo ""
-echo -e "  ${YELLOW}━━━  Как проверить  ━━━${NC}"
+echo -e "  ${YELLOW}━━━  Управление  ━━━${NC}"
 echo ""
-echo -e "  ${DIM}Логи прокси:    journalctl -u mtprotoproxy -f${NC}"
-echo -e "  ${DIM}Логи Caddy:     journalctl -u caddy -f${NC}"
-echo -e "  ${DIM}Тест маскировки: curl -sk https://${DOMAIN}:8443 | head -5${NC}"
-echo -e "  ${DIM}Страница:       nano /var/www/html/index.html && systemctl restart caddy${NC}"
+echo -e "  ${DIM}Логи прокси:     journalctl -u mtprotoproxy -f${NC}"
+echo -e "  ${DIM}Логи nginx:      journalctl -u nginx -f  /  tail -f /var/log/nginx/error.log${NC}"
+echo -e "  ${DIM}Тест маскировки: curl -sk https://127.0.0.1:8443 | head -5${NC}"
+echo -e "  ${DIM}Тест сертификата: certbot certificates${NC}"
+echo -e "  ${DIM}Страница:        nano /var/www/html/index.html && systemctl reload nginx${NC}"
 echo ""
 echo -e "  ${YELLOW}━━━  Как работает маскировка  ━━━${NC}"
 echo ""
-echo -e "  Клиент Telegram → :443 → mtprotoproxy узнаёт MTProto → туннель в Telegram"
-echo -e "  DPI/сканер       → :443 → mtprotoproxy не узнаёт    → Caddy:8443 (реальный сайт)"
-echo -e "  Браузер          → :80  → Caddy (HTML-страница)"
+echo -e "  Клиент Telegram → :443 → mtprotoproxy → MTProto ОК → туннель в Telegram"
+echo -e "  DPI/сканер       → :443 → mtprotoproxy → не MTProto → nginx:8443 (TLS 1.3 + HTML)"
+echo -e "  Браузер          → :80  → nginx (HTML-страница)"
 echo ""
