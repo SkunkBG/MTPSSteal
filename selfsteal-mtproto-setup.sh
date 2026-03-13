@@ -129,9 +129,8 @@ TLS_DOMAIN = "${DOMAIN}"
 
 # КЛЮЧЕВАЯ НАСТРОЙКА SELFSTEAL:
 # Куда перенаправлять DPI/сканеры, которые не говорят MTProto.
-# Caddy слушает на 8443 и отдаёт реальную страницу с TLS-сертификатом.
-# DPI видит легитимный TLS-хендшейк с твоим сертификатом.
-PROXY_URL = "https://127.0.0.1:8443"
+# Caddy слушает на 8080 (plain HTTP, только localhost) и отдаёт страницу.
+PROXY_URL = "http://127.0.0.1:8080"
 
 # Без ограничений на соединения
 MAX_CONNECTIONS = 0
@@ -203,28 +202,41 @@ echo -e "${CYAN}[*] Настраиваю Caddy...${NC}"
 
 cat > /etc/caddy/Caddyfile << CADDYEOF
 {
-    http_port 80
-    https_port 8443
     email admin@${DOMAIN}
 }
 
-# Caddy получает Let's Encrypt сертификат через порт 80
-# и отдаёт реальную страницу на порту 8443 (только localhost)
+# Публичный HTTP — отдаёт страницу браузеру + ACME для сертификата
+${DOMAIN}:80 {
+    header {
+        -Server
+        X-Content-Type-Options "nosniff"
+    }
+    root * /var/www/html
+    try_files {path} /index.html
+    file_server
+}
+
+# Внутренний HTTPS — для faketls-маскировки (mtprotoproxy → сюда при TLS-пробе)
 ${DOMAIN}:8443 {
     bind 127.0.0.1
-
     tls {
         protocols tls1.2 tls1.3
     }
-
     header {
-        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
-        X-Content-Type-Options    "nosniff"
-        X-Frame-Options           "SAMEORIGIN"
-        Referrer-Policy           "no-referrer"
+        -Server
+        X-Content-Type-Options "nosniff"
+    }
+    root * /var/www/html
+    try_files {path} /index.html
+    file_server
+}
+
+# Внутренний plain HTTP — PROXY_URL для mtprotoproxy (перенаправление DPI/сканеров)
+:8080 {
+    bind 127.0.0.1
+    header {
         -Server
     }
-
     root * /var/www/html
     try_files {path} /index.html
     file_server
@@ -264,8 +276,9 @@ echo -e "${CYAN}[*] Настраиваю файрвол...${NC}"
 if command -v ufw &>/dev/null; then
     ufw allow 80/tcp   > /dev/null 2>&1 || true
     ufw allow 443/tcp  > /dev/null 2>&1 || true
-    ufw delete allow 8443/tcp > /dev/null 2>&1 || true  # закрываем снаружи
-    echo -e "${GREEN}[✓] UFW: 80, 443 открыты | 8443 только localhost${NC}"
+    ufw delete allow 8443/tcp > /dev/null 2>&1 || true
+    ufw delete allow 8080/tcp > /dev/null 2>&1 || true
+    echo -e "${GREEN}[✓] UFW: 80, 443 открыты | 8443, 8080 только localhost${NC}"
 fi
 
 # ── Запуск ─────────────────────────────────────────────────
@@ -319,9 +332,10 @@ echo -e "  ${CYAN}${FAKETLS_SECRET}${NC}"
 echo ""
 echo -e "  ${YELLOW}━━━  Порты  ━━━${NC}"
 echo ""
-echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + маскировка)"
-echo -e "  ${BOLD}80${NC}    → Caddy (ACME-сертификат)"
-echo -e "  ${BOLD}8443${NC}  → Caddy stub-страница (только 127.0.0.1)"
+echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + faketls маскировка)"
+echo -e "  ${BOLD}80${NC}    → Caddy (страница в браузере + ACME-сертификат)"
+echo -e "  ${BOLD}8443${NC}  → Caddy HTTPS (только 127.0.0.1 — faketls TLS-проба)"
+echo -e "  ${BOLD}8080${NC}  → Caddy HTTP  (только 127.0.0.1 — PROXY_URL для DPI)"
 echo ""
 echo -e "  ${DIM}Логи прокси:  journalctl -u mtprotoproxy -f${NC}"
 echo -e "  ${DIM}Логи Caddy:   journalctl -u caddy -f${NC}"
