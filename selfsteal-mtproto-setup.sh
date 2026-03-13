@@ -1,15 +1,16 @@
 #!/bin/bash
 
 # ============================================================
-#  MTProto SelfSteal Installer
+#  MTProto SelfSteal Installer v2
 #  Telegram MTProto Proxy + Caddy (маскировка под свой домен)
 #
 #  Архитектура:
 #    Port 443  → mtprotoproxy (faketls)
-#                  ├─ MTProto клиент → туннель Telegram
-#                  └─ DPI/сканер    → Caddy:8443 (реальный сайт)
-#    Port 8443 → Caddy (TLS + stub-страница, только localhost)
-#    Port 80   → Caddy (ACME + редирект)
+#                  ├─ MTProto клиент → туннель в Telegram
+#                  └─ DPI / сканер   → Caddy:8443 (127.0.0.1)
+#                                          └─ реальный сайт + валидный TLS
+#    Port 80   → Caddy (ACME + страница в браузере)
+#    Port 8443 → Caddy HTTPS (только localhost, для маскировки)
 #
 #  Требования: Debian/Ubuntu, root, домен с A-записью на сервер
 # ============================================================
@@ -27,7 +28,7 @@ NC='\033[0m'
 echo -e "${CYAN}"
 cat << 'BANNER'
  ╔══════════════════════════════════════════════════════════╗
- ║       MTProto SelfSteal Installer                        ║
+ ║       MTProto SelfSteal Installer  v2                   ║
  ║       Telegram прокси под маскировкой своего домена      ║
  ╚══════════════════════════════════════════════════════════╝
 BANNER
@@ -86,54 +87,52 @@ apt update -qq > /dev/null 2>&1
 apt install -y python3 python3-pip git curl dnsutils ufw > /dev/null 2>&1
 
 # ── Генерация секрета ──────────────────────────────────────
-# faketls-секрет = "ee" + 16 случайных байт в hex (итого 34 символа)
-# Домен маскировки задаётся отдельно через TLS_DOMAIN в config.py
-FAKETLS_SECRET="ee$(python3 -c "import os; print(os.urandom(16).hex())")"
-echo -e "${GREEN}[✓] Секрет сгенерирован${NC}"
+# FakeTLS-секрет для Telegram = "ee" + 16 случайных байт (hex) + домен в hex
+# Клиент читает домен из секрета и ставит его в SNI поле TLS ClientHello
+RANDOM_KEY=$(python3 -c "import os; print(os.urandom(16).hex())")
+DOMAIN_HEX=$(python3 -c "print('${DOMAIN}'.encode().hex())")
+FAKETLS_SECRET="ee${RANDOM_KEY}${DOMAIN_HEX}"
+echo -e "${GREEN}[✓] FakeTLS-секрет сгенерирован (содержит домен ${DOMAIN})${NC}"
 
 # ── Установка mtprotoproxy ─────────────────────────────────
-echo -e "${CYAN}[*] Устанавливаю mtprotoproxy...${NC}"
+echo -e "${CYAN}[*] Устанавливаю mtprotoproxy (stable)...${NC}"
 PROXY_DIR="/opt/mtprotoproxy"
 
 if [[ -d "$PROXY_DIR" ]]; then
     echo -e "${YELLOW}[!] mtprotoproxy уже установлен, обновляю...${NC}"
+    git -C "$PROXY_DIR" fetch --all -q 2>/dev/null || true
+    git -C "$PROXY_DIR" checkout stable -q 2>/dev/null || true
     git -C "$PROXY_DIR" pull -q 2>/dev/null || true
 else
-    git clone -q https://github.com/alexbers/mtprotoproxy.git "$PROXY_DIR"
+    git clone -q -b stable https://github.com/alexbers/mtprotoproxy.git "$PROXY_DIR"
 fi
-echo -e "${GREEN}[✓] mtprotoproxy готов${NC}"
+echo -e "${GREEN}[✓] mtprotoproxy готов (stable)${NC}"
 
 # ── Конфиг mtprotoproxy ────────────────────────────────────
 cat > "${PROXY_DIR}/config.py" << PYEOF
 # ── MTProto SelfSteal Config ────────────────────────────────
-# Сгенерировано selfsteal-mtproto-setup.sh
+# Сгенерировано selfsteal-mtproto-setup.sh v2
 
-# Порт (443 = максимальная скрытность)
+# Порт прокси (443 = максимальная скрытность)
 PORT = 443
 
-# Привязка
-BIND_IP = "0.0.0.0"
-
-# Пользователи и их faketls-секреты
-# Формат секрета: "ee" + домен в hex = маскировка под TLS
+# Пользователи и их секреты
+# Секрет начинается на "ee" = режим faketls (автоматически)
 USERS = {
     "user1": "${FAKETLS_SECRET}",
 }
 
-# Режим: faketls — трафик выглядит как обычный HTTPS
-# Клиенту нужно указать именно faketls-секрет (начинается на "ee")
-MODE = "faketls"
-
-# Домен маскировки — должен совпадать с доменом в секрете
+# Домен маскировки — влияет на стартовое сообщение в логах
+# Реальный домен для SNI берётся клиентом из секрета
 TLS_DOMAIN = "${DOMAIN}"
 
-# КЛЮЧЕВАЯ НАСТРОЙКА SELFSTEAL:
-# Куда перенаправлять DPI/сканеры, которые не говорят MTProto.
-# Caddy слушает на 8080 (plain HTTP, только localhost) и отдаёт страницу.
-PROXY_URL = "http://127.0.0.1:8080"
-
-# Без ограничений на соединения
-MAX_CONNECTIONS = 0
+# ── SelfSteal: маскировка под свой сайт ─────────────────────
+# Когда DPI/сканер подключается без MTProto-хендшейка,
+# mtprotoproxy пробрасывает соединение на MASK_HOST:MASK_PORT
+# Caddy на 8443 отдаёт реальную HTML-страницу с валидным TLS
+MASK = True
+MASK_HOST = "127.0.0.1"
+MASK_PORT = 8443
 PYEOF
 
 echo -e "${GREEN}[✓] Конфиг mtprotoproxy создан${NC}"
@@ -195,7 +194,7 @@ case "$STUB_CHOICE" in
 esac
 echo -e "${GREEN}[✓] Stub-страница создана${NC}"
 
-# ── Caddyfile (порт 8443, только localhost) ────────────────
+# ── Caddyfile ──────────────────────────────────────────────
 echo -e "${CYAN}[*] Настраиваю Caddy...${NC}"
 [[ -f /etc/caddy/Caddyfile ]] && \
     cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)"
@@ -205,7 +204,7 @@ cat > /etc/caddy/Caddyfile << CADDYEOF
     email admin@${DOMAIN}
 }
 
-# Публичный HTTP — отдаёт страницу браузеру + ACME для сертификата
+# Публичный HTTP — страница в браузере + ACME для получения сертификата
 ${DOMAIN}:80 {
     header {
         -Server
@@ -216,7 +215,8 @@ ${DOMAIN}:80 {
     file_server
 }
 
-# Внутренний HTTPS — для faketls-маскировки (mtprotoproxy → сюда при TLS-пробе)
+# Внутренний HTTPS — для маскировки (mtprotoproxy → сюда при TLS-пробе от DPI)
+# Только localhost! DPI видит валидный TLS-сертификат и реальную HTML-страницу
 ${DOMAIN}:8443 {
     bind 127.0.0.1
     tls {
@@ -225,17 +225,6 @@ ${DOMAIN}:8443 {
     header {
         -Server
         X-Content-Type-Options "nosniff"
-    }
-    root * /var/www/html
-    try_files {path} /index.html
-    file_server
-}
-
-# Внутренний plain HTTP — PROXY_URL для mtprotoproxy (перенаправление DPI/сканеров)
-:8080 {
-    bind 127.0.0.1
-    header {
-        -Server
     }
     root * /var/www/html
     try_files {path} /index.html
@@ -277,8 +266,7 @@ if command -v ufw &>/dev/null; then
     ufw allow 80/tcp   > /dev/null 2>&1 || true
     ufw allow 443/tcp  > /dev/null 2>&1 || true
     ufw delete allow 8443/tcp > /dev/null 2>&1 || true
-    ufw delete allow 8080/tcp > /dev/null 2>&1 || true
-    echo -e "${GREEN}[✓] UFW: 80, 443 открыты | 8443, 8080 только localhost${NC}"
+    echo -e "${GREEN}[✓] UFW: 80, 443 открыты | 8443 только localhost${NC}"
 fi
 
 # ── Запуск ─────────────────────────────────────────────────
@@ -287,27 +275,25 @@ systemctl enable caddy > /dev/null 2>&1
 systemctl restart caddy
 sleep 5
 
+# Проверяем что Caddy получил сертификат и слушает 8443
+if systemctl is-active --quiet caddy; then
+    echo -e "${GREEN}[✓] Caddy запущен${NC}"
+else
+    echo -e "${RED}[✗] Caddy не запустился!${NC}"
+    echo -e "${YELLOW}    Проверь: journalctl -u caddy -n 30${NC}"
+    echo -e "${YELLOW}    Убедись что порт 80 открыт и DNS ведёт на сервер${NC}"
+fi
+
 echo -e "${CYAN}[*] Запускаю mtprotoproxy...${NC}"
 systemctl enable mtprotoproxy > /dev/null 2>&1
 systemctl start mtprotoproxy
 sleep 3
 
-# ── Проверка ───────────────────────────────────────────────
-CADDY_OK=false
-PROXY_OK=false
-
-if systemctl is-active --quiet caddy; then
-    CADDY_OK=true
-    echo -e "${GREEN}[✓] Caddy запущен${NC}"
-else
-    echo -e "${RED}[✗] Caddy не запустился — journalctl -u caddy -n 20${NC}"
-fi
-
 if systemctl is-active --quiet mtprotoproxy; then
-    PROXY_OK=true
     echo -e "${GREEN}[✓] mtprotoproxy запущен${NC}"
 else
-    echo -e "${RED}[✗] mtprotoproxy не запустился — journalctl -u mtprotoproxy -n 20${NC}"
+    echo -e "${RED}[✗] mtprotoproxy не запустился!${NC}"
+    echo -e "${YELLOW}    Проверь: journalctl -u mtprotoproxy -n 30${NC}"
 fi
 
 # ── Ссылка для подключения ────────────────────────────────
@@ -316,16 +302,18 @@ TG_LINK="https://t.me/proxy?server=${DOMAIN}&port=443&secret=${FAKETLS_SECRET}"
 # ── Итог ───────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║         ✓  MTProto SelfSteal готов                       ║${NC}"
+echo -e "${GREEN}║         ✓  MTProto SelfSteal готов!                      ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}Домен:${NC}          ${CYAN}${DOMAIN}${NC}"
 echo -e "  ${BOLD}IP сервера:${NC}     ${CYAN}${SERVER_IP}${NC}"
 echo -e "  ${BOLD}Маскировка:${NC}     ${CYAN}${STUB_NAMES[$((STUB_CHOICE-1))]}${NC}"
 echo ""
-echo -e "  ${YELLOW}━━━  Ссылка для подключения в Telegram  ━━━${NC}"
+echo -e "  ${YELLOW}━━━  Ссылка для Telegram  ━━━${NC}"
 echo ""
 echo -e "  ${GREEN}${TG_LINK}${NC}"
+echo ""
+echo -e "  ${DIM}Скопируй ссылку → отправь в Saved Messages → нажми → Подключить${NC}"
 echo ""
 echo -e "  ${BOLD}Секрет (faketls):${NC}"
 echo -e "  ${CYAN}${FAKETLS_SECRET}${NC}"
@@ -334,16 +322,18 @@ echo -e "  ${YELLOW}━━━  Порты  ━━━${NC}"
 echo ""
 echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + faketls маскировка)"
 echo -e "  ${BOLD}80${NC}    → Caddy (страница в браузере + ACME-сертификат)"
-echo -e "  ${BOLD}8443${NC}  → Caddy HTTPS (только 127.0.0.1 — faketls TLS-проба)"
-echo -e "  ${BOLD}8080${NC}  → Caddy HTTP  (только 127.0.0.1 — PROXY_URL для DPI)"
+echo -e "  ${BOLD}8443${NC}  → Caddy HTTPS (только 127.0.0.1 — TLS-проба от DPI)"
 echo ""
-echo -e "  ${DIM}Логи прокси:  journalctl -u mtprotoproxy -f${NC}"
-echo -e "  ${DIM}Логи Caddy:   journalctl -u caddy -f${NC}"
-echo -e "  ${DIM}Страница:     nano /var/www/html/index.html && systemctl restart caddy${NC}"
+echo -e "  ${YELLOW}━━━  Как проверить  ━━━${NC}"
+echo ""
+echo -e "  ${DIM}Логи прокси:    journalctl -u mtprotoproxy -f${NC}"
+echo -e "  ${DIM}Логи Caddy:     journalctl -u caddy -f${NC}"
+echo -e "  ${DIM}Тест маскировки: curl -sk https://${DOMAIN}:8443 | head -5${NC}"
+echo -e "  ${DIM}Страница:       nano /var/www/html/index.html && systemctl restart caddy${NC}"
 echo ""
 echo -e "  ${YELLOW}━━━  Как работает маскировка  ━━━${NC}"
 echo ""
-echo -e "  DPI/сканер подключается → видит TLS-хендшейк с сертификатом ${DOMAIN}"
-echo -e "  mtprotoproxy перенаправляет на Caddy → получает реальную HTML-страницу"
-echo -e "  Для блокировщика трафик неотличим от обычного HTTPS-сайта"
+echo -e "  Клиент Telegram → :443 → mtprotoproxy узнаёт MTProto → туннель в Telegram"
+echo -e "  DPI/сканер       → :443 → mtprotoproxy не узнаёт    → Caddy:8443 (реальный сайт)"
+echo -e "  Браузер          → :80  → Caddy (HTML-страница)"
 echo ""
