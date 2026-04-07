@@ -428,29 +428,41 @@ TMPCONF
 ln -sf "/etc/nginx/sites-available/${DOMAIN}-temp" /etc/nginx/sites-enabled/
 rm -f "/etc/nginx/sites-enabled/${DOMAIN}"
 
-nginx -t > /dev/null 2>&1 && systemctl restart nginx
+nginx -t > /dev/null 2>&1 && systemctl restart nginx || {
+    echo -e "${YELLOW}[!] nginx -t failed, пробую без hardening.conf...${NC}"
+    rm -f /etc/nginx/conf.d/hardening.conf
+    nginx -t > /dev/null 2>&1 && systemctl restart nginx
+}
 echo -e "${GREEN}[✓] nginx запущен (HTTP)${NC}"
 
 echo -e "${CYAN}[*] Получаю TLS-сертификат (Let's Encrypt)...${NC}"
-certbot certonly --webroot -w "/var/www/${DOMAIN}" -d "${DOMAIN}" \
-    --non-interactive --agree-tos --register-unsafely-without-email \
-    --quiet 2>/dev/null
-
-if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+if certbot certonly --webroot -w "/var/www/${DOMAIN}" -d "${DOMAIN}" \
+    --non-interactive --agree-tos --register-unsafely-without-email 2>&1 | tail -5; then
     echo -e "${GREEN}[✓] Сертификат получен${NC}"
 else
-    echo -e "${RED}[✗] Сертификат не получен — проверь DNS и порт 80${NC}"
-    echo -e "    Вручную: certbot certonly --webroot -w /var/www/${DOMAIN} -d ${DOMAIN}"
-    read -rp "$(echo -e "${YELLOW}[?] Продолжить без сертификата? (y/n): ${NC}")" CONT
-    [[ "$CONT" != "y" ]] && exit 1
+    echo ""
+    if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+        echo -e "${YELLOW}[!] certbot вернул ошибку, но сертификат существует — продолжаю${NC}"
+    else
+        echo -e "${RED}[✗] Сертификат не получен — проверь DNS и порт 80${NC}"
+        echo -e "    Вручную: certbot certonly --webroot -w /var/www/${DOMAIN} -d ${DOMAIN}"
+        read -rp "$(echo -e "${YELLOW}[?] Продолжить без сертификата? (y/n): ${NC}")" CONT
+        [[ "$CONT" != "y" ]] && exit 1
+    fi
 fi
 
 # Переключаем на полный конфиг
 rm -f "/etc/nginx/sites-enabled/${DOMAIN}-temp"
 rm -f "/etc/nginx/sites-available/${DOMAIN}-temp"
 ln -sf "/etc/nginx/sites-available/${DOMAIN}" /etc/nginx/sites-enabled/
-nginx -t > /dev/null 2>&1 && systemctl restart nginx
-echo -e "${GREEN}[✓] nginx настроен (HTTP + HTTPS localhost)${NC}"
+if nginx -t > /dev/null 2>&1; then
+    systemctl restart nginx
+    echo -e "${GREEN}[✓] nginx настроен (HTTP + HTTPS localhost)${NC}"
+else
+    echo -e "${RED}[✗] nginx -t failed после включения SSL-конфига${NC}"
+    nginx -t 2>&1 | tail -5
+    echo -e "${YELLOW}    Проверь: /etc/nginx/sites-available/${DOMAIN}${NC}"
+fi
 
 # ── Автообновление сертификата ─────────────────────────────
 if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
