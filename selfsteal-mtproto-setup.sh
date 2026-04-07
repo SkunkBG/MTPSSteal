@@ -318,23 +318,23 @@ echo -e "${CYAN}[*] Настраиваю nginx...${NC}"
 # Удаляем default
 rm -f /etc/nginx/sites-enabled/default
 
-# Глобальный hardening
+# Глобальный hardening — зоны rate-limit + server_tokens
 cat > /etc/nginx/conf.d/hardening.conf << 'NGXHARD'
-# ── Глобальный hardening ──────────────────────────────────
 server_tokens off;
-more_clear_headers Server;
 
-# Rate-limiting зоны
+# Rate-limiting зоны (используются в site-конфиге)
 limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
 limit_req_zone $binary_remote_addr zone=probe:10m rate=3r/s;
 limit_conn_zone $binary_remote_addr zone=connlimit:10m;
 NGXHARD
 
-# Проверяем, есть ли модуль headers-more
-if ! nginx -V 2>&1 | grep -q "headers-more"; then
-    # Если нет модуля — убираем more_clear_headers, используем пустой server header
-    sed -i '/more_clear_headers/d' /etc/nginx/conf.d/hardening.conf
-    echo -e "${YELLOW}[!] Модуль headers-more не найден — Server header скроем через proxy_pass_header${NC}"
+# headers-more для полного скрытия Server header (опционально)
+if nginx -V 2>&1 | grep -q "headers-more"; then
+    sed -i '1a more_clear_headers Server;' /etc/nginx/conf.d/hardening.conf
+    echo -e "${GREEN}[✓] Модуль headers-more найден — Server header скрыт${NC}"
+else
+    echo -e "${YELLOW}[!] Модуль headers-more не найден (server_tokens off достаточно)${NC}"
+    echo -e "${DIM}    Установить: apt install libnginx-mod-http-headers-more-filter${NC}"
 fi
 
 # Основной site-конфиг
@@ -428,11 +428,12 @@ TMPCONF
 ln -sf "/etc/nginx/sites-available/${DOMAIN}-temp" /etc/nginx/sites-enabled/
 rm -f "/etc/nginx/sites-enabled/${DOMAIN}"
 
-nginx -t > /dev/null 2>&1 && systemctl restart nginx || {
-    echo -e "${YELLOW}[!] nginx -t failed, пробую без hardening.conf...${NC}"
-    rm -f /etc/nginx/conf.d/hardening.conf
-    nginx -t > /dev/null 2>&1 && systemctl restart nginx
-}
+if nginx -t > /dev/null 2>&1; then
+    systemctl restart nginx
+else
+    echo -e "${YELLOW}[!] nginx -t failed, диагностика:${NC}"
+    nginx -t 2>&1 | tail -5
+fi
 echo -e "${GREEN}[✓] nginx запущен (HTTP)${NC}"
 
 echo -e "${CYAN}[*] Получаю TLS-сертификат (Let's Encrypt)...${NC}"
