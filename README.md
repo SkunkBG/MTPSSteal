@@ -1,35 +1,19 @@
-# MTProto SelfSteal Proxy v4
+# MTPSSteal v5 — mtproto.zig + DPI Evasion
 
-Telegram MTProto прокси с маскировкой трафика под собственный домен.
+Высокопроизводительный Telegram MTProto прокси с полной защитой от DPI.
 
-## Как работает
+## Что внутри
 
-```
-Клиент → :443 (mtprotoproxy, faketls)
-              ├─ Telegram-клиент  ──► туннель в Telegram
-              └─ DPI / сканер     ──► nginx:8443 (127.0.0.1)
-                                          └─ реальный сайт + валидный TLS
-```
-
-DPI и активные зонды видят легитимный TLS-сертификат на **твоём** домене и реальную HTML-страницу с подстраницами. Трафик неотличим от обычного HTTPS-сайта.
-
-## Что нового в v4
-
-- **FakeTLS-секрет** — формат `ee` + hex(домен) для корректной SNI-маскировки
-- **PROXY_URL через HTTPS** — DPI при пробинге получает полный TLS-хендшейк с валидным сертификатом
-- **Hardened nginx** — HSTS, скрытый Server header, rate-limiting, CSP
-- **Подстраницы** — `/about`, `/contact`, `robots.txt`, `sitemap.xml`, `favicon.ico` — сайт выглядит живым
-- **Запуск не от root** — mtprotoproxy работает от пользователя `mtproto` с `CAP_NET_BIND_SERVICE`
-- **systemd hardening** — `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`
-- **fail2ban** — защита SSH + детекция probe-сканеров по логам nginx
-- **logrotate** — автоочистка логов
-
-## Требования
-
-- Сервер с Debian или Ubuntu (20.04+)
-- Root-доступ
-- Домен с A-записью, указывающей на IP сервера
-- Открытые порты: `80`, `443`
+| Технология | Описание |
+|------------|----------|
+| **mtproto.zig** | 126 КБ бинарник, ~120 КБ RAM, 0 зависимостей, Zig |
+| **FakeTLS 1.3** | Трафик неотличим от обычного HTTPS |
+| **TCPMSS=88** | ClientHello фрагментируется на 6 TCP-пакетов — ломает DPI |
+| **Split-TLS** | 1-байтный чанкинг TLS-записей |
+| **DRS** | Dynamic Record Sizing — имитация Chrome/Firefox |
+| **Anti-replay** | Отклоняет повторные хендшейки (±2 мин), блокирует ТСПУ Ревизор |
+| **Маскировка** | DPI-пробы перенаправляются на реальный сайт (wb.ru, ozon.ru...) |
+| **zapret/nfqws** | TCP desync: fake packets + TTL spoofing (опционально) |
 
 ## Установка
 
@@ -38,101 +22,63 @@ bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/MTPSSteal/main/selfste
 ```
 
 Скрипт спросит:
-
-1. **Домен** — должен резолвиться на IP сервера
-2. **Стиль страницы-маскировки** — 5 вариантов на выбор
-
-## Порты
-
-| Порт | Сервис | Доступ |
-|------|--------|--------|
-| `443` | mtprotoproxy | Публичный — VPN-соединения |
-| `80` | nginx | Публичный — ACME + редирект |
-| `8443` | nginx HTTPS | **Только localhost** — TLS-проба для DPI |
-
-## Маскировочные страницы
-
-| № | Название | Описание |
-|---|----------|----------|
-| 1 | Минимальный 404 | Тёмный лаконичный 404 |
-| 2 | Котики 404 | Весёлая страница с анимацией |
-| 3 | Tech-компания | Корпоративный лендинг (NovaTech) |
-| 4 | Облачный хостинг | SaaS / хостинг стиль (VortexHost) |
-| 5 | Личный блог | Инженерный блог |
-
-Все темы включают подстраницы `/about`, `/contact`, а также `robots.txt`, `sitemap.xml` и `favicon.ico`.
-
-## Файлы после установки
-
-| Файл | Путь |
-|------|------|
-| Конфиг прокси | `/opt/mtprotoproxy/config.py` |
-| Маскировочные страницы | `/var/www/<домен>/` |
-| nginx конфиг | `/etc/nginx/sites-available/<домен>` |
-| nginx hardening | `/etc/nginx/conf.d/hardening.conf` |
-| fail2ban jail | `/etc/fail2ban/jail.d/selfsteal.conf` |
-| systemd юнит | `/etc/systemd/system/mtprotoproxy.service` |
+1. **Домен** — должен вести на сервер
+2. **Домен маскировки** — реальный сайт для перенаправления DPI (wb.ru, ozon.ru...)
+3. **zapret/nfqws** — установить TCP desync
 
 ## Управление
 
 ```bash
-# Статус
-systemctl status mtprotoproxy
-systemctl status nginx
+# Логи
+journalctl -u mtproto-proxy -f
 
 # Перезапуск
-systemctl restart mtprotoproxy
-systemctl restart nginx
+systemctl restart mtproto-proxy
 
-# Логи
-journalctl -u mtprotoproxy -f
-tail -f /var/log/nginx/<домен>_ssl_access.log
+# Конфиг
+nano /opt/mtproto-proxy/config.toml
 
-# fail2ban
-fail2ban-client status
-fail2ban-client status nginx-probe
+# Подбор стратегии nfqws под провайдера
+cd /opt/zapret && ./blockcheck.sh
 ```
 
-## Обновление секрета
+## Конфиг
 
-```bash
-# Сгенерировать faketls-секрет для нового домена
-NEW_SECRET="ee$(python3 -c "print('newdomain.com'.encode().hex())")"
-echo "$NEW_SECRET"
+```toml
+[server]
+port = 443
 
-# Вставить в конфиг
-nano /opt/mtprotoproxy/config.py
+[censorship]
+tls_domain = "wb.ru"    # куда перенаправлять DPI-пробы
+mask = true              # включить маскировку
+fast_mode = true         # zero-copy S2C (меньше CPU/RAM)
 
-# Перезапустить
-systemctl restart mtprotoproxy
+[access.users]
+tg = "00112233445566778899aabbccddeeff"   # 16 байт hex
 ```
+
+## Добавление пользователей
+
+```toml
+[access.users]
+alice = "00112233445566778899aabbccddeeff"
+bob   = "ffeeddccbbaa99887766554433221100"
+```
+
+Сгенерировать секрет: `openssl rand -hex 16`
 
 ## Удаление
 
 ```bash
-systemctl stop mtprotoproxy nginx
-systemctl disable mtprotoproxy nginx
-rm -rf /opt/mtprotoproxy
-rm -f /etc/systemd/system/mtprotoproxy.service
-rm -f /etc/nginx/sites-enabled/<домен>
-rm -f /etc/nginx/sites-available/<домен>
-rm -f /etc/nginx/conf.d/hardening.conf
-rm -f /etc/fail2ban/jail.d/selfsteal.conf
-rm -f /etc/fail2ban/filter.d/nginx-probe.conf
-rm -rf /var/www/<домен>
+systemctl stop mtproto-proxy nfqws-mtproto
+systemctl disable mtproto-proxy nfqws-mtproto
+rm -rf /opt/mtproto-proxy
+rm -f /etc/systemd/system/mtproto-proxy.service
+rm -f /etc/systemd/system/nfqws-mtproto.service
+rm -rf /opt/zapret
 userdel mtproto 2>/dev/null
-certbot delete --cert-name <домен>
 systemctl daemon-reload
 ```
-
-## Безопасность
-
-- mtprotoproxy запущен от выделенного пользователя `mtproto`, не root
-- systemd юнит использует `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`
-- nginx скрывает `Server` header, включает HSTS и rate-limiting
-- fail2ban банит SSH брутфорс и probe-сканеры
-- faketls-секрет в формате `ee` + hex(домен) — стандарт FakeTLS для SNI-маскировки
-- `SECURE_ONLY = True` — отклоняет plain MTProto без faketls
 
 ## Лицензия
 
