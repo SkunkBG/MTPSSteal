@@ -318,10 +318,14 @@ echo -e "${CYAN}[*] Настраиваю nginx...${NC}"
 # Удаляем default
 rm -f /etc/nginx/sites-enabled/default
 
-# Глобальный hardening — зоны rate-limit + server_tokens
-cat > /etc/nginx/conf.d/hardening.conf << 'NGXHARD'
-server_tokens off;
+# Глобальный hardening
+# server_tokens off — добавляем в nginx.conf если ещё нет (избегаем дубликата)
+if ! grep -q 'server_tokens off' /etc/nginx/nginx.conf 2>/dev/null; then
+    sed -i '/http {/a\    server_tokens off;' /etc/nginx/nginx.conf
+fi
 
+# Rate-limiting зоны (отдельный файл, без server_tokens)
+cat > /etc/nginx/conf.d/hardening.conf << 'NGXHARD'
 # Rate-limiting зоны (используются в site-конфиге)
 limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
 limit_req_zone $binary_remote_addr zone=probe:10m rate=3r/s;
@@ -330,7 +334,7 @@ NGXHARD
 
 # headers-more для полного скрытия Server header (опционально)
 if nginx -V 2>&1 | grep -q "headers-more"; then
-    sed -i '1a more_clear_headers Server;' /etc/nginx/conf.d/hardening.conf
+    echo 'more_clear_headers Server;' >> /etc/nginx/conf.d/hardening.conf
     echo -e "${GREEN}[✓] Модуль headers-more найден — Server header скрыт${NC}"
 else
     echo -e "${YELLOW}[!] Модуль headers-more не найден (server_tokens off достаточно)${NC}"
