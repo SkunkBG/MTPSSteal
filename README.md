@@ -1,21 +1,28 @@
-# 🛡️ MTProto SelfSteal Proxy
+# MTProto SelfSteal Proxy v4
 
-Telegram MTProto прокси с маскировкой трафика под собственный домен. DPI и активные зонды видят легитимный TLS 1.3 сертификат и реальную HTML-страницу — трафик неотличим от обычного HTTPS-сайта.
+Telegram MTProto прокси с маскировкой трафика под собственный домен.
 
 ## Как работает
 
 ```
-Клиент Telegram → :443 → mtprotoproxy → MTProto хендшейк ОК → туннель в Telegram
-DPI / сканер    → :443 → mtprotoproxy → хендшейк не MTProto → nginx:8443 (TLS 1.3 + HTML)
-Браузер         → :80  → nginx → HTML-страница
+Клиент → :443 (mtprotoproxy, faketls)
+              ├─ Telegram-клиент  ──► туннель в Telegram
+              └─ DPI / сканер     ──► nginx:8443 (127.0.0.1)
+                                          └─ реальный сайт + валидный TLS
 ```
 
-**Почему это надёжно:**
-- nginx отдаёт чистый TLS 1.3 хендшейк без лишних записей — идеально для маскировки
-- FakeTLS-секрет содержит домен → клиент ставит правильный SNI в TLS ClientHello
-- mtprotoproxy на порту 443 принимает только MTProto-клиентов
-- Все остальные (DPI, сканеры) перенаправляются на nginx с валидным Let's Encrypt сертификатом
-- Сертификат обновляется автоматически через certbot
+DPI и активные зонды видят легитимный TLS-сертификат на **твоём** домене и реальную HTML-страницу с подстраницами. Трафик неотличим от обычного HTTPS-сайта.
+
+## Что нового в v4
+
+- **Случайный секрет** — faketls-секрет генерируется из 16 случайных байт, не вычисляется из домена
+- **PROXY_URL через HTTPS** — DPI при пробинге получает полный TLS-хендшейк с валидным сертификатом
+- **Hardened nginx** — HSTS, скрытый Server header, rate-limiting, CSP
+- **Подстраницы** — `/about`, `/contact`, `robots.txt`, `sitemap.xml`, `favicon.ico` — сайт выглядит живым
+- **Запуск не от root** — mtprotoproxy работает от пользователя `mtproto` с `CAP_NET_BIND_SERVICE`
+- **systemd hardening** — `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`
+- **fail2ban** — защита SSH + детекция probe-сканеров по логам nginx
+- **logrotate** — автоочистка логов
 
 ## Требования
 
@@ -24,49 +31,24 @@ DPI / сканер    → :443 → mtprotoproxy → хендшейк не MTProt
 - Домен с A-записью, указывающей на IP сервера
 - Открытые порты: `80`, `443`
 
-> ⚠️ Cloudflare прокси (оранжевое облако) должно быть **выключено** — только DNS-only (серое облако). Иначе TLS-хендшейк и выдача сертификата сломаются.
-
 ## Установка
-
-**Один шаг:**
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/SkunkBG/MTPSSteal/main/selfsteal-mtproto-setup.sh)
 ```
 
-**Или вручную:**
-
-```bash
-curl -Lo setup.sh https://raw.githubusercontent.com/SkunkBG/MTPSSteal/main/selfsteal-mtproto-setup.sh
-bash setup.sh
-```
-
 Скрипт спросит:
 
 1. **Домен** — должен резолвиться на IP сервера
-2. **Стиль маскировочной страницы** — на выбор 5 вариантов
-
-После установки выведет готовую ссылку `tg://proxy?...` — отправь в Telegram и нажми «Подключить».
-
-## Что делает скрипт
-
-1. Проверяет DNS — домен должен вести на сервер
-2. Устанавливает зависимости (`python3`, `nginx`, `certbot`, `git`)
-3. Клонирует [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) (ветка `stable`)
-4. Генерирует FakeTLS-секрет: 32-hex ключ для `config.py` + полная ссылка для клиента
-5. Настраивает nginx (HTTP + HTTPS localhost с TLS 1.3)
-6. Получает TLS-сертификат через certbot (Let's Encrypt)
-7. Настраивает автообновление сертификата
-8. Создаёт маскировочную страницу
-9. Запускает всё через systemd
+2. **Стиль страницы-маскировки** — 5 вариантов на выбор
 
 ## Порты
 
-| Порт | Сервис | Доступ | Назначение |
-|------|--------|--------|------------|
-| `443` | mtprotoproxy | Публичный | MTProto + FakeTLS маскировка |
-| `80` | nginx | Публичный | HTML-страница + ACME challenge |
-| `8443` | nginx HTTPS | **Только localhost** | TLS 1.3 ответ для DPI/сканеров |
+| Порт | Сервис | Доступ |
+|------|--------|--------|
+| `443` | mtprotoproxy | Публичный — VPN-соединения |
+| `80` | nginx | Публичный — ACME + редирект |
+| `8443` | nginx HTTPS | **Только localhost** — TLS-проба для DPI |
 
 ## Маскировочные страницы
 
@@ -78,34 +60,18 @@ bash setup.sh
 | 4 | Облачный хостинг | SaaS / хостинг стиль (VortexHost) |
 | 5 | Личный блог | Инженерный блог |
 
-Заменить страницу после установки:
-
-```bash
-nano /var/www/html/index.html
-systemctl reload nginx
-```
-
-## Подключение в Telegram
-
-### По ссылке (самый простой способ):
-1. Скопируй ссылку `tg://proxy?server=...` из вывода скрипта
-2. Отправь её себе в «Избранное» (Saved Messages) в Telegram
-3. Нажми на неё → Telegram предложит подключить прокси → **Подключить**
-
-### Вручную:
-1. **Настройки** → **Данные и память** → **Тип соединения** → **Использовать прокси**
-2. Нажми **Добавить прокси** → тип **MTProto**
-3. Заполни: Сервер, Порт (443), Секрет (начинается с `ee`)
+Все темы включают подстраницы `/about`, `/contact`, а также `robots.txt`, `sitemap.xml` и `favicon.ico`.
 
 ## Файлы после установки
 
 | Файл | Путь |
 |------|------|
 | Конфиг прокси | `/opt/mtprotoproxy/config.py` |
-| Маскировочная страница | `/var/www/html/index.html` |
-| nginx конфиг | `/etc/nginx/sites-available/selfsteal` |
-| TLS сертификат | `/etc/letsencrypt/live/<домен>/` |
-| Systemd юнит | `/etc/systemd/system/mtprotoproxy.service` |
+| Маскировочные страницы | `/var/www/<домен>/` |
+| nginx конфиг | `/etc/nginx/sites-available/<домен>` |
+| nginx hardening | `/etc/nginx/conf.d/hardening.conf` |
+| fail2ban jail | `/etc/fail2ban/jail.d/selfsteal.conf` |
+| systemd юнит | `/etc/systemd/system/mtprotoproxy.service` |
 
 ## Управление
 
@@ -116,50 +82,30 @@ systemctl status nginx
 
 # Перезапуск
 systemctl restart mtprotoproxy
-systemctl reload nginx
+systemctl restart nginx
 
 # Логи
 journalctl -u mtprotoproxy -f
-tail -f /var/log/nginx/error.log
+tail -f /var/log/nginx/<домен>_ssl_access.log
 
-# Сертификат
-certbot certificates
-certbot renew --dry-run
+# fail2ban
+fail2ban-client status
+fail2ban-client status nginx-probe
 ```
 
-## Диагностика
+## Обновление секрета
 
-**Прокси не подключается:**
 ```bash
-systemctl status mtprotoproxy nginx
-ss -tlnp | grep -E '443|80|8443'
-journalctl -u mtprotoproxy --no-pager -n 30
-```
+# Сгенерировать новый случайный секрет
+NEW_SECRET="ee$(python3 -c "import os; print(os.urandom(16).hex())")"
+echo "$NEW_SECRET"
 
-**Проверить маскировочную страницу:**
-```bash
-curl -sk https://127.0.0.1:8443 | head -5
-```
-
-**Проверить TLS версию:**
-```bash
-echo | openssl s_client -connect 127.0.0.1:8443 -tls1_3 2>/dev/null | grep "Protocol"
-```
-
-**Обновить секрет:**
-```bash
-NEW_KEY=$(python3 -c "import os; print(os.urandom(16).hex())")
-DOMAIN="example.com"  # замени на свой
-DOMAIN_HEX=$(python3 -c "print('${DOMAIN}'.encode().hex())")
-
-echo "Ключ для config.py USERS: ${NEW_KEY}"
-echo "Ссылка: ee${NEW_KEY}${DOMAIN_HEX}"
-
+# Вставить в конфиг
 nano /opt/mtprotoproxy/config.py
+
+# Перезапустить
 systemctl restart mtprotoproxy
 ```
-
-> **Важно:** в `USERS` хранится только 32-hex ключ. Полный секрет `ee` + ключ + домен — только в ссылке для клиента.
 
 ## Удаление
 
@@ -168,18 +114,25 @@ systemctl stop mtprotoproxy nginx
 systemctl disable mtprotoproxy nginx
 rm -rf /opt/mtprotoproxy
 rm -f /etc/systemd/system/mtprotoproxy.service
-rm -f /etc/nginx/sites-enabled/selfsteal
-rm -f /etc/nginx/sites-available/selfsteal
-certbot delete --cert-name example.com  # замени на свой домен
-rm -rf /var/www/html
+rm -f /etc/nginx/sites-enabled/<домен>
+rm -f /etc/nginx/sites-available/<домен>
+rm -f /etc/nginx/conf.d/hardening.conf
+rm -f /etc/fail2ban/jail.d/selfsteal.conf
+rm -f /etc/fail2ban/filter.d/nginx-probe.conf
+rm -rf /var/www/<домен>
+userdel mtproto 2>/dev/null
+certbot delete --cert-name <домен>
 systemctl daemon-reload
 ```
 
-## Благодарности
+## Безопасность
 
-- [alexbers/mtprotoproxy](https://github.com/alexbers/mtprotoproxy) — async MTProto proxy на Python
-- [nginx](https://nginx.org/) — высокопроизводительный веб-сервер
-- [certbot](https://certbot.eff.org/) — автоматические TLS-сертификаты
+- mtprotoproxy запущен от выделенного пользователя `mtproto`, не root
+- systemd юнит использует `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`
+- nginx скрывает `Server` header, включает HSTS и rate-limiting
+- fail2ban банит SSH брутфорс и probe-сканеры
+- faketls-секрет случайный — нельзя вычислить зная домен
+- `SECURE_ONLY = True` — отклоняет plain MTProto без faketls
 
 ## Лицензия
 

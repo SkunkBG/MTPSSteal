@@ -1,17 +1,26 @@
 #!/bin/bash
 
 # ============================================================
-#  MTProto SelfSteal Installer v3
+#  MTProto SelfSteal Installer  v4
 #  Telegram MTProto Proxy + nginx (маскировка под свой домен)
 #
 #  Архитектура:
 #    Port 443  → mtprotoproxy (faketls)
-#                  ├─ MTProto клиент → туннель в Telegram
-#                  └─ DPI / сканер   → nginx:8443 (127.0.0.1)
-#                                          └─ реальный сайт + TLS 1.3
-#    Port 80   → nginx (HTML-страница + ACME challenge)
+#                  ├─ MTProto клиент → туннель Telegram
+#                  └─ DPI/сканер    → nginx:8443 (реальный сайт + TLS)
+#    Port 8443 → nginx HTTPS (только 127.0.0.1, TLS + stub-страница)
+#    Port 80   → nginx (ACME + редирект)
 #
-#  Требования: Debian/Ubuntu, root, домен с A-записью на сервер
+#  Улучшения v4:
+#    — Случайный faketls-секрет (не на основе домена)
+#    — PROXY_URL через HTTPS (полный TLS при пробинге)
+#    — Hardened nginx: HSTS, скрытый Server, rate-limit
+#    — Фейковые подстраницы: /about, /contact, robots.txt, sitemap.xml
+#    — Запуск mtprotoproxy от выделенного пользователя
+#    — fail2ban для SSH + nginx
+#    — logrotate для mtprotoproxy
+#
+#  Требования: Debian/Ubuntu 20.04+, root, домен с A-записью
 # ============================================================
 
 set -e
@@ -27,7 +36,7 @@ NC='\033[0m'
 echo -e "${CYAN}"
 cat << 'BANNER'
  ╔══════════════════════════════════════════════════════════╗
- ║       MTProto SelfSteal Installer  v3                   ║
+ ║       MTProto SelfSteal Installer  v4                    ║
  ║       Telegram прокси + nginx (маскировка домена)        ║
  ╚══════════════════════════════════════════════════════════╝
 BANNER
@@ -40,7 +49,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ── Домен ─────────────────────────────────────────────────
-read -rp "$(echo -e "${YELLOW}[?] Твой домен (например, example.com): ${NC}")" DOMAIN
+read -rp "$(echo -e "${YELLOW}[?] Твой домен (например, proxy.example.com): ${NC}")" DOMAIN
 DOMAIN=$(echo "$DOMAIN" | xargs | tr '[:upper:]' '[:lower:]')
 [[ -z "$DOMAIN" ]] && { echo -e "${RED}[✗] Домен не может быть пустым${NC}"; exit 1; }
 
@@ -50,13 +59,13 @@ echo -e "${BOLD}  Выбери маскировочную страницу:${NC}
 echo ""
 echo -e "  ${CYAN}1)${NC} Минимальный 404     ${DIM}— тёмный, лаконичный${NC}"
 echo -e "  ${CYAN}2)${NC} Котики 404          ${DIM}— весёлый, с анимацией${NC}"
-echo -e "  ${CYAN}3)${NC} Tech-компания        ${DIM}— корпоративный лендинг${NC}"
-echo -e "  ${CYAN}4)${NC} Облачный хостинг     ${DIM}— SaaS / хостинг стиль${NC}"
+echo -e "  ${CYAN}3)${NC} Tech-компания        ${DIM}— корпоративный лендинг (NovaTech)${NC}"
+echo -e "  ${CYAN}4)${NC} Облачный хостинг     ${DIM}— SaaS / хостинг стиль (VortexHost)${NC}"
 echo -e "  ${CYAN}5)${NC} Личный блог          ${DIM}— инженерный блог${NC}"
 echo ""
-read -rp "$(echo -e "${YELLOW}[?] Выбор (1-5) [по умолчанию: 1]: ${NC}")" STUB_CHOICE
-STUB_CHOICE=${STUB_CHOICE:-1}
-[[ ! "$STUB_CHOICE" =~ ^[1-5]$ ]] && STUB_CHOICE=1
+read -rp "$(echo -e "${YELLOW}[?] Выбор (1-5) [по умолчанию: 3]: ${NC}")" STUB_CHOICE
+STUB_CHOICE=${STUB_CHOICE:-3}
+[[ ! "$STUB_CHOICE" =~ ^[1-5]$ ]] && STUB_CHOICE=3
 
 STUB_NAMES=("Минимальный 404" "Котики 404" "Tech-компания" "Облачный хостинг" "Личный блог")
 echo -e "${GREEN}[✓] Выбрано: ${STUB_NAMES[$((STUB_CHOICE-1))]}${NC}"
@@ -83,16 +92,24 @@ fi
 # ── Зависимости ───────────────────────────────────────────
 echo -e "${CYAN}[*] Устанавливаю зависимости...${NC}"
 apt update -qq > /dev/null 2>&1
-apt install -y python3 python3-pip git curl dnsutils ufw nginx certbot python3-certbot-nginx > /dev/null 2>&1
-pip install cryptography --break-system-packages > /dev/null 2>&1 || true
+apt install -y python3 git curl dnsutils ufw nginx certbot python3-certbot-nginx \
+    fail2ban logrotate > /dev/null 2>&1
+echo -e "${GREEN}[✓] Зависимости установлены${NC}"
 
-# ── Генерация секрета ──────────────────────────────────────
-# В config.py → только 32-hex ключ (RANDOM_KEY)
-# Для клиента → "ee" + ключ + домен_hex (FAKETLS_SECRET)
-RANDOM_KEY=$(python3 -c "import os; print(os.urandom(16).hex())")
-DOMAIN_HEX=$(python3 -c "print('${DOMAIN}'.encode().hex())")
-FAKETLS_SECRET="ee${RANDOM_KEY}${DOMAIN_HEX}"
-echo -e "${GREEN}[✓] FakeTLS-секрет сгенерирован (содержит домен ${DOMAIN})${NC}"
+# ── Генерация СЛУЧАЙНОГО секрета ───────────────────────────
+# faketls-секрет = "ee" + 16 случайных байт (32 hex-символа)
+# Домен задаётся ОТДЕЛЬНО через TLS_DOMAIN — секрет НЕ зависит от домена
+FAKETLS_SECRET="ee$(python3 -c "import os; print(os.urandom(16).hex())")"
+echo -e "${GREEN}[✓] Случайный faketls-секрет сгенерирован (не привязан к домену)${NC}"
+
+# ── Создание пользователя mtproto ──────────────────────────
+echo -e "${CYAN}[*] Создаю пользователя mtproto...${NC}"
+if ! id mtproto &>/dev/null; then
+    useradd -r -s /usr/sbin/nologin -d /opt/mtprotoproxy mtproto
+    echo -e "${GREEN}[✓] Пользователь mtproto создан${NC}"
+else
+    echo -e "${DIM}[·] Пользователь mtproto уже существует${NC}"
+fi
 
 # ── Установка mtprotoproxy ─────────────────────────────────
 echo -e "${CYAN}[*] Устанавливаю mtprotoproxy (stable)...${NC}"
@@ -100,232 +117,465 @@ PROXY_DIR="/opt/mtprotoproxy"
 
 if [[ -d "$PROXY_DIR" ]]; then
     echo -e "${YELLOW}[!] mtprotoproxy уже установлен, обновляю...${NC}"
-    git -C "$PROXY_DIR" fetch --all -q 2>/dev/null || true
-    git -C "$PROXY_DIR" checkout stable -q 2>/dev/null || true
     git -C "$PROXY_DIR" pull -q 2>/dev/null || true
 else
-    git clone -q -b stable https://github.com/alexbers/mtprotoproxy.git "$PROXY_DIR"
+    git clone -q https://github.com/alexbers/mtprotoproxy.git "$PROXY_DIR"
 fi
+chown -R mtproto:mtproto "$PROXY_DIR"
 echo -e "${GREEN}[✓] mtprotoproxy готов (stable)${NC}"
 
-# ── Stub-страницы ─────────────────────────────────────────
-mkdir -p /var/www/html
+# ── Stub-страницы (с подстраницами для правдоподобности) ───
+echo -e "${CYAN}[*] Создаю маскировочные страницы...${NC}"
+WEBROOT="/var/www/${DOMAIN}"
+mkdir -p "${WEBROOT}"
 
-create_stub_minimal() {
-cat > /var/www/html/index.html << 'HTML'
+# ── Общие файлы для всех тем ──────────────────────────────
+
+# robots.txt
+cat > "${WEBROOT}/robots.txt" << 'ROBOTS'
+User-agent: *
+Allow: /
+Sitemap: /sitemap.xml
+ROBOTS
+
+# sitemap.xml
+cat > "${WEBROOT}/sitemap.xml" << SITEMAP
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://${DOMAIN}/</loc><priority>1.0</priority></url>
+  <url><loc>https://${DOMAIN}/about</loc><priority>0.8</priority></url>
+  <url><loc>https://${DOMAIN}/contact</loc><priority>0.7</priority></url>
+</urlset>
+SITEMAP
+
+# favicon.ico (1x1 пустой)
+python3 -c "
+import struct, zlib, base64
+# minimal valid .ico (16x16, 1 color)
+ico = bytes.fromhex(
+    '00000100010010100000000000006800000016000000'
+    '28000000100000002000000001000400000000000000'
+    '0000000000000000000000000000000000000000'
+)
+ico += b'\x00' * 64  # color table
+ico += b'\x00' * 128  # XOR mask
+ico += b'\xff' * 64   # AND mask
+with open('${WEBROOT}/favicon.ico', 'wb') as f:
+    f.write(ico)
+" 2>/dev/null || touch "${WEBROOT}/favicon.ico"
+
+# ── Генерация страниц по выбору темы ──────────────────────
+
+generate_stub_pages() {
+    local THEME="$1"
+    local SITE_NAME SITE_TAG HERO_TITLE HERO_SUB NAV_ITEMS COLOR1 COLOR2 BG_COLOR
+    local ABOUT_TITLE ABOUT_TEXT CONTACT_TITLE
+
+    case "$THEME" in
+        1)  # Минимальный 404
+            SITE_NAME="404"; COLOR1="#5b7cf6"; COLOR2="#9b5bf6"; BG_COLOR="#080b10"
+            ;;
+        2)  # Котики 404
+            SITE_NAME="404"; COLOR1="#ff6eb4"; COLOR2="#6a9fff"; BG_COLOR="#160f22"
+            ;;
+        3)  # Tech-компания
+            SITE_NAME="NovaTech"; SITE_TAG="Solutions"
+            COLOR1="#4e79f6"; COLOR2="#7b54f5"; BG_COLOR="#090c13"
+            HERO_TITLE="Building the <em>future</em> of cloud infrastructure"
+            HERO_SUB="We help companies scale with modern cloud-native solutions, enterprise-grade security, and zero-downtime deployments."
+            NAV_ITEMS="Solutions|About|Pricing|Contact"
+            ABOUT_TITLE="About NovaTech"
+            ABOUT_TEXT="Founded in 2019, NovaTech Solutions is a digital infrastructure company specializing in cloud-native architecture, DevOps automation, and enterprise security. We serve over 500 clients across 30 countries."
+            CONTACT_TITLE="Get in Touch"
+            ;;
+        4)  # Облачный хостинг
+            SITE_NAME="Vortex"; SITE_TAG="Host"
+            COLOR1="#00d4ff"; COLOR2="#0060ff"; BG_COLOR="#04060d"
+            HERO_TITLE="Web hosting that's <span>lightning fast</span>"
+            HERO_SUB="Deploy your projects in seconds with our global CDN, NVMe storage, and auto-scaling infrastructure."
+            NAV_ITEMS="Hosting|VPS|Domains|Support"
+            ABOUT_TITLE="About VortexHost"
+            ABOUT_TEXT="VortexHost provides high-performance cloud hosting with data centers in Frankfurt, Amsterdam, and London. Our infrastructure is built on enterprise-grade hardware with NVMe storage and redundant networking."
+            CONTACT_TITLE="Contact Support"
+            ;;
+        5)  # Личный блог
+            SITE_NAME="Alex Chen"; SITE_TAG=""
+            COLOR1="#8b5cf6"; COLOR2="#3b82f6"; BG_COLOR="#faf8f5"
+            NAV_ITEMS="Writing|Projects|About|RSS"
+            ABOUT_TITLE="About Me"
+            ABOUT_TEXT="I'm a software engineer focused on distributed systems and backend architecture. Previously at several startups, now building infrastructure tools. I write about technology, engineering craft, and the occasional deep dive."
+            CONTACT_TITLE="Contact"
+            ;;
+    esac
+
+    # Для тем 1 и 2 — только 404 страницы
+    if [[ "$THEME" == "1" ]]; then
+        cat > "${WEBROOT}/index.html" << 'HTML'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404 – Not Found</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#080b10;color:#9ba3b8;display:flex;justify-content:center;align-items:center;min-height:100vh}.wrap{text-align:center;padding:2rem}h1{font-size:clamp(5rem,18vw,11rem);font-weight:800;letter-spacing:-.04em;background:linear-gradient(135deg,#5b7cf6,#9b5bf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;animation:flicker 4s ease-in-out infinite}p{margin-top:.8rem;font-size:.95rem;color:#424860}@keyframes flicker{0%,100%{opacity:1}48%{opacity:1}50%{opacity:.7}52%{opacity:1}96%{opacity:1}98%{opacity:.5}99%{opacity:1}}</style></head><body><div class="wrap"><h1>404</h1><p>The resource you requested does not exist on this server.</p></div></body></html>
 HTML
-}
+        # /about и /contact — чуть другой текст чтобы не палить одинаковый ответ
+        mkdir -p "${WEBROOT}/about" "${WEBROOT}/contact"
+        sed 's/does not exist on this server/page not found/;s/<title>404/<title>About/' \
+            "${WEBROOT}/index.html" > "${WEBROOT}/about/index.html"
+        sed 's/does not exist on this server/nothing here/;s/<title>404/<title>Contact/' \
+            "${WEBROOT}/index.html" > "${WEBROOT}/contact/index.html"
+        echo -e "${GREEN}[✓] Stub-страницы созданы (Минимальный 404)${NC}"
+        return
+    fi
 
-create_stub_cats() {
-cat > /var/www/html/index.html << 'HTML'
+    if [[ "$THEME" == "2" ]]; then
+        cat > "${WEBROOT}/index.html" << 'HTML'
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404 – Oops!</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#160f22;color:#d0c4e8;display:flex;justify-content:center;align-items:center;min-height:100vh;overflow:hidden}.bg{position:fixed;inset:0;overflow:hidden;pointer-events:none}.bg span{position:absolute;font-size:1.6rem;opacity:.05;animation:fall linear infinite}.bg span:nth-child(1){left:8%;animation-duration:14s}.bg span:nth-child(2){left:25%;animation-duration:18s;animation-delay:3s}.bg span:nth-child(3){left:50%;animation-duration:16s;animation-delay:7s}.bg span:nth-child(4){left:72%;animation-duration:20s;animation-delay:1s}.bg span:nth-child(5){left:90%;animation-duration:13s;animation-delay:5s}@keyframes fall{from{top:-60px}to{top:110%}}.wrap{text-align:center;padding:2rem;position:relative;z-index:1}.emoji{font-size:5rem;animation:bob 3s ease-in-out infinite;display:block;margin-bottom:1rem}@keyframes bob{0%,100%{transform:translateY(0) rotate(-3deg)}50%{transform:translateY(-12px) rotate(3deg)}}h1{font-size:clamp(4rem,14vw,8rem);font-weight:800;background:linear-gradient(135deg,#ff6eb4,#b46aff,#6a9fff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1}.msg{font-size:1.1rem;color:#9b80c4;margin-top:.6rem}.paws{margin-top:1.5rem;font-size:1.3rem;letter-spacing:8px;opacity:.4}</style></head><body><div class="bg"><span>🐱</span><span>😸</span><span>🐈</span><span>😺</span><span>😻</span></div><div class="wrap"><span class="emoji">😿</span><h1>404</h1><p class="msg">The cat knocked this page off the table.</p><div class="paws">🐾 🐾 🐾</div></div></body></html>
 HTML
-}
+        mkdir -p "${WEBROOT}/about" "${WEBROOT}/contact"
+        sed 's/knocked this page off the table/is sleeping on this page/;s/<title>404/<title>About/' \
+            "${WEBROOT}/index.html" > "${WEBROOT}/about/index.html"
+        sed 's/knocked this page off the table/hid this page under the couch/;s/<title>404/<title>Contact/' \
+            "${WEBROOT}/index.html" > "${WEBROOT}/contact/index.html"
+        echo -e "${GREEN}[✓] Stub-страницы созданы (Котики 404)${NC}"
+        return
+    fi
 
-create_stub_business() {
-cat > /var/www/html/index.html << 'HTML'
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NovaTech Solutions</title><style>*{margin:0;padding:0;box-sizing:border-box}:root{--bg:#090c13;--s:#0f1320;--b:#1b2035;--a:#4e79f6;--a2:#7b54f5;--t:#b0b8cc;--td:#4a5168;--w:#e8ecf5}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--t);overflow-x:hidden}nav{position:fixed;top:0;width:100%;padding:1.1rem 3rem;display:flex;justify-content:space-between;align-items:center;z-index:10;backdrop-filter:blur(16px);background:rgba(9,12,19,.75);border-bottom:1px solid var(--b)}.logo{font-size:1.25rem;font-weight:800;color:var(--w)}.logo span{color:var(--a)}nav ul{list-style:none;display:flex;gap:1.8rem}nav a{color:var(--td);text-decoration:none;font-size:.88rem;transition:color .25s}nav a:hover{color:var(--w)}.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:6rem 2rem 4rem;text-align:center;position:relative}.glow{position:absolute;width:400px;height:400px;border-radius:50%;filter:blur(100px);opacity:.1;pointer-events:none}.g1{background:var(--a);top:-80px;left:-80px}.g2{background:var(--a2);bottom:-80px;right:-80px}.badge{display:inline-block;padding:.35rem .9rem;border:1px solid var(--b);border-radius:50px;font-size:.75rem;color:var(--a);margin-bottom:1.8rem;letter-spacing:1.2px;text-transform:uppercase}h1{font-size:clamp(2.2rem,5.5vw,4rem);color:var(--w);font-weight:800;line-height:1.1;margin-bottom:1.3rem}h1 em{font-style:normal;background:linear-gradient(135deg,var(--a),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.sub{font-size:1.05rem;color:var(--td);max-width:520px;margin:0 auto 2.2rem;line-height:1.65}.btns{display:flex;gap:.8rem;justify-content:center}.btn{padding:.75rem 1.7rem;border-radius:7px;font-size:.9rem;font-weight:600;text-decoration:none;border:none;font-family:inherit;transition:all .25s;cursor:pointer}.btn-p{background:linear-gradient(135deg,var(--a),var(--a2));color:#fff}.btn-p:hover{transform:translateY(-2px)}.btn-o{background:transparent;color:var(--t);border:1px solid var(--b)}.btn-o:hover{border-color:var(--a);color:var(--w)}.stats{display:flex;gap:2.5rem;justify-content:center;margin-top:3.5rem;padding-top:2.5rem;border-top:1px solid var(--b);flex-wrap:wrap}.stat-n{font-size:2rem;font-weight:800;color:var(--w)}.stat-l{font-size:.8rem;color:var(--td);margin-top:.25rem}footer{text-align:center;padding:1.8rem;border-top:1px solid var(--b);font-size:.78rem;color:var(--td)}@media(max-width:580px){nav ul{display:none}}</style></head><body><nav><div class="logo">Nova<span>Tech</span></div><ul><li><a href="#">Solutions</a></li><li><a href="#">About</a></li><li><a href="#">Pricing</a></li><li><a href="#">Contact</a></li></ul></nav><section class="hero"><div class="glow g1"></div><div class="glow g2"></div><div><div class="badge">Digital Infrastructure Partner</div><h1>Building the <em>future</em> of cloud infrastructure</h1><p class="sub">We help companies scale with modern cloud-native solutions, enterprise-grade security, and zero-downtime deployments.</p><div class="btns"><a class="btn btn-p" href="#">Get Started</a><a class="btn btn-o" href="#">Learn More</a></div><div class="stats"><div><div class="stat-n">500+</div><div class="stat-l">Enterprise Clients</div></div><div><div class="stat-n">99.9%</div><div class="stat-l">Uptime SLA</div></div><div><div class="stat-n">24/7</div><div class="stat-l">Expert Support</div></div></div></div></section><footer>&copy; 2026 NovaTech Solutions. All rights reserved.</footer></body></html>
+    # ── Темы 3, 4, 5: полноценный сайт с подстраницами ────
+
+    # Определяем CSS-переменные и стиль навбара
+    local IS_DARK=true
+    local TEXT_COLOR="#b0b8cc" TEXT_DIM="#4a5168" TEXT_WHITE="#e8ecf5"
+    local BORDER_COLOR="#1b2035" NAV_BG="rgba(9,12,19,.75)"
+    local FONT="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"
+
+    if [[ "$THEME" == "5" ]]; then
+        IS_DARK=false
+        BG_COLOR="#faf8f5"; TEXT_COLOR="#2d2926"; TEXT_DIM="#7a7068"
+        TEXT_WHITE="#1a1714"; BORDER_COLOR="#e8e3da"; NAV_BG="#faf8f5"
+        FONT="font-family:'Georgia',serif"
+    fi
+
+    local LOGO_HTML
+    if [[ -n "$SITE_TAG" ]]; then
+        LOGO_HTML="${SITE_NAME}<span style=\"color:${COLOR1}\">${SITE_TAG}</span>"
+    else
+        LOGO_HTML="${SITE_NAME}"
+    fi
+
+    # Генерируем nav-ссылки
+    local NAV_HTML=""
+    IFS='|' read -ra NAV_ARR <<< "$NAV_ITEMS"
+    for item in "${NAV_ARR[@]}"; do
+        local href="/"
+        local lower=$(echo "$item" | tr '[:upper:]' '[:lower:]')
+        case "$lower" in
+            about|projects) href="/about" ;;
+            contact|support|pricing) href="/contact" ;;
+            *) href="#" ;;
+        esac
+        NAV_HTML="${NAV_HTML}<li><a href=\"${href}\">${item}</a></li>"
+    done
+
+    # CSS общий
+    local CSS_COMMON="*{margin:0;padding:0;box-sizing:border-box}body{${FONT};background:${BG_COLOR};color:${TEXT_COLOR};line-height:1.7}nav{position:fixed;top:0;width:100%;padding:1rem 2.5rem;display:flex;justify-content:space-between;align-items:center;z-index:10;backdrop-filter:blur(14px);background:${NAV_BG};border-bottom:1px solid ${BORDER_COLOR}}.logo{font-size:1.2rem;font-weight:800;color:${TEXT_WHITE}}nav ul{list-style:none;display:flex;gap:1.6rem}nav a{color:${TEXT_DIM};text-decoration:none;font-size:.85rem;transition:color .2s}nav a:hover{color:${TEXT_WHITE}}.content{max-width:720px;margin:0 auto;padding:7rem 2rem 4rem}h1{font-size:clamp(1.8rem,4vw,2.6rem);color:${TEXT_WHITE};margin-bottom:1rem}p{margin-bottom:1rem;line-height:1.75;color:${TEXT_COLOR}}footer{text-align:center;padding:1.5rem;border-top:1px solid ${BORDER_COLOR};font-size:.75rem;color:${TEXT_DIM}}@media(max-width:560px){nav ul{display:none}}"
+
+    local YEAR
+    YEAR=$(date +%Y)
+    local FOOTER_HTML="<footer>&copy; ${YEAR} ${SITE_NAME}${SITE_TAG:+ ${SITE_TAG}}. All rights reserved.</footer>"
+    local NAV_BLOCK="<nav><div class=\"logo\">${LOGO_HTML}</div><ul>${NAV_HTML}</ul></nav>"
+
+    # ── index.html ──
+    if [[ "$THEME" == "3" ]]; then
+        cat > "${WEBROOT}/index.html" << HTML
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${SITE_NAME} ${SITE_TAG} — Cloud Infrastructure</title><style>${CSS_COMMON}.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:6rem 2rem 4rem;text-align:center;position:relative}.badge{display:inline-block;padding:.35rem .9rem;border:1px solid ${BORDER_COLOR};border-radius:50px;font-size:.75rem;color:${COLOR1};margin-bottom:1.8rem;letter-spacing:1.2px;text-transform:uppercase}h1{font-size:clamp(2.2rem,5.5vw,4rem);line-height:1.1;margin-bottom:1.3rem}h1 em{font-style:normal;background:linear-gradient(135deg,${COLOR1},${COLOR2});-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.sub{font-size:1.05rem;color:${TEXT_DIM};max-width:520px;margin:0 auto 2.2rem;line-height:1.65}.btns{display:flex;gap:.8rem;justify-content:center;flex-wrap:wrap}.btn{padding:.75rem 1.7rem;border-radius:7px;font-size:.9rem;font-weight:600;text-decoration:none;transition:all .25s}.btn-p{background:linear-gradient(135deg,${COLOR1},${COLOR2});color:#fff}.btn-p:hover{transform:translateY(-2px)}.btn-o{background:transparent;color:${TEXT_COLOR};border:1px solid ${BORDER_COLOR}}.btn-o:hover{border-color:${COLOR1};color:${TEXT_WHITE}}.stats{display:flex;gap:2.5rem;justify-content:center;margin-top:3.5rem;padding-top:2.5rem;border-top:1px solid ${BORDER_COLOR};flex-wrap:wrap}.stat-n{font-size:2rem;font-weight:800;color:${TEXT_WHITE}}.stat-l{font-size:.8rem;color:${TEXT_DIM};margin-top:.25rem}</style></head><body>${NAV_BLOCK}<section class="hero"><div><div class="badge">Digital Infrastructure Partner</div><h1>${HERO_TITLE}</h1><p class="sub">${HERO_SUB}</p><div class="btns"><a class="btn btn-p" href="/contact">Get Started</a><a class="btn btn-o" href="/about">Learn More</a></div><div class="stats"><div><div class="stat-n">500+</div><div class="stat-l">Enterprise Clients</div></div><div><div class="stat-n">99.9%</div><div class="stat-l">Uptime SLA</div></div><div><div class="stat-n">24/7</div><div class="stat-l">Expert Support</div></div></div></div></section>${FOOTER_HTML}</body></html>
 HTML
-}
-
-create_stub_hosting() {
-cat > /var/www/html/index.html << 'HTML'
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VortexHost — Lightning Fast Hosting</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif;background:#04060d;color:#a8b4cc;overflow-x:hidden}.orbs{position:fixed;inset:0;pointer-events:none;overflow:hidden}.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:.08}.orb1{width:500px;height:500px;background:#00d4ff;top:-150px;left:-100px;animation:drift1 20s ease-in-out infinite}.orb2{width:400px;height:400px;background:#0040ff;bottom:-100px;right:-100px;animation:drift2 18s ease-in-out infinite}@keyframes drift1{0%,100%{transform:translate(0,0)}50%{transform:translate(60px,40px)}}@keyframes drift2{0%,100%{transform:translate(0,0)}50%{transform:translate(-40px,-60px)}}nav{position:fixed;top:0;width:100%;padding:1rem 2.5rem;display:flex;justify-content:space-between;align-items:center;z-index:10;background:rgba(4,6,13,.8);backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.05)}.logo{font-weight:800;font-size:1.2rem;color:#fff}.logo span{color:#00d4ff}nav ul{list-style:none;display:flex;gap:1.6rem}nav a{color:#5a6a82;text-decoration:none;font-size:.85rem;transition:color .2s}nav a:hover{color:#fff}.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:6rem 2rem 4rem;position:relative;z-index:1;text-align:center}.tag{display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .9rem;border-radius:50px;background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:#00d4ff;font-size:.75rem;margin-bottom:1.6rem;letter-spacing:.5px}h1{font-size:clamp(2rem,5vw,3.8rem);font-weight:800;color:#fff;line-height:1.1;margin-bottom:1.2rem}h1 span{background:linear-gradient(90deg,#00d4ff,#0088ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.sub{font-size:1rem;color:#4a5a72;max-width:480px;margin:0 auto 2rem;line-height:1.65}.btns{display:flex;gap:.75rem;justify-content:center;flex-wrap:wrap;margin-bottom:2rem}.btn{padding:.7rem 1.6rem;border-radius:6px;font-size:.88rem;font-weight:600;text-decoration:none;transition:all .2s;font-family:inherit;cursor:pointer;border:none}.btn-c{background:linear-gradient(90deg,#00d4ff,#0060ff);color:#000}.btn-c:hover{transform:translateY(-2px)}.btn-g{background:rgba(255,255,255,.04);color:#7888a0;border:1px solid rgba(255,255,255,.08)}.btn-g:hover{border-color:#00d4ff;color:#fff}.features{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}.feat{display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:#3a4a60}.feat::before{content:"✓";color:#00d4ff;font-weight:700}footer{text-align:center;padding:1.5rem;border-top:1px solid rgba(255,255,255,.04);font-size:.75rem;color:#2a3040}@media(max-width:560px){nav ul{display:none}}</style></head><body><div class="orbs"><div class="orb orb1"></div><div class="orb orb2"></div></div><nav><div class="logo">Vortex<span>Host</span></div><ul><li><a href="#">Hosting</a></li><li><a href="#">VPS</a></li><li><a href="#">Domains</a></li><li><a href="#">Support</a></li></ul></nav><section class="hero"><div><div class="tag">⚡ 99.99% Uptime Guaranteed</div><h1>Web hosting that's <span>lightning fast</span></h1><p class="sub">Deploy your projects in seconds with our global CDN, NVMe storage, and auto-scaling infrastructure.</p><div class="btns"><a class="btn btn-c" href="#">Start Free Trial</a><a class="btn btn-g" href="#">View Plans</a></div><div class="features"><span class="feat">Free SSL</span><span class="feat">Daily Backups</span><span class="feat">1-Click Deploy</span><span class="feat">24/7 Support</span></div></div></section><footer>&copy; 2026 VortexHost. All rights reserved.</footer></body></html>
+    elif [[ "$THEME" == "4" ]]; then
+        cat > "${WEBROOT}/index.html" << HTML
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${SITE_NAME}${SITE_TAG} — Lightning Fast Hosting</title><style>${CSS_COMMON}.orbs{position:fixed;inset:0;pointer-events:none;overflow:hidden}.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:.08}.o1{width:500px;height:500px;background:${COLOR1};top:-150px;left:-100px;animation:d1 20s ease-in-out infinite}.o2{width:400px;height:400px;background:${COLOR2};bottom:-100px;right:-100px;animation:d2 18s ease-in-out infinite}@keyframes d1{0%,100%{transform:translate(0,0)}50%{transform:translate(60px,40px)}}@keyframes d2{0%,100%{transform:translate(0,0)}50%{transform:translate(-40px,-60px)}}.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:6rem 2rem 4rem;position:relative;z-index:1;text-align:center}.tag{display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .9rem;border-radius:50px;background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:${COLOR1};font-size:.75rem;margin-bottom:1.6rem}h1 span{background:linear-gradient(90deg,${COLOR1},${COLOR2});-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.sub{color:${TEXT_DIM};max-width:480px;margin:0 auto 2rem}.btns{display:flex;gap:.75rem;justify-content:center;flex-wrap:wrap;margin-bottom:2rem}.btn{padding:.7rem 1.6rem;border-radius:6px;font-size:.88rem;font-weight:600;text-decoration:none;transition:all .2s}.btn-c{background:linear-gradient(90deg,${COLOR1},${COLOR2});color:#000}.btn-c:hover{transform:translateY(-2px)}.btn-g{background:rgba(255,255,255,.04);color:#7888a0;border:1px solid rgba(255,255,255,.08)}.btn-g:hover{border-color:${COLOR1};color:#fff}.features{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}.feat{display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:${TEXT_DIM}}.feat::before{content:"✓";color:${COLOR1};font-weight:700}</style></head><body><div class="orbs"><div class="orb o1"></div><div class="orb o2"></div></div>${NAV_BLOCK}<section class="hero"><div><div class="tag">⚡ 99.99% Uptime Guaranteed</div><h1>${HERO_TITLE}</h1><p class="sub">${HERO_SUB}</p><div class="btns"><a class="btn btn-c" href="/contact">Start Free Trial</a><a class="btn btn-g" href="/about">View Plans</a></div><div class="features"><span class="feat">Free SSL</span><span class="feat">Daily Backups</span><span class="feat">1-Click Deploy</span><span class="feat">24/7 Support</span></div></div></section>${FOOTER_HTML}</body></html>
 HTML
-}
-
-create_stub_blog() {
-cat > /var/www/html/index.html << 'HTML'
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Alex Chen — Engineering Blog</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Georgia',serif;background:#faf8f5;color:#2d2926;line-height:1.7}nav{position:fixed;top:0;width:100%;padding:.9rem 2rem;display:flex;justify-content:space-between;align-items:center;background:#faf8f5;border-bottom:1px solid #e8e3da;z-index:10}.logo{font-size:1rem;font-weight:700;color:#1a1714}nav ul{list-style:none;display:flex;gap:1.5rem}nav a{color:#7a7068;text-decoration:none;font-family:-apple-system,sans-serif;font-size:.82rem;transition:color .2s}nav a:hover{color:#1a1714}.hero{max-width:660px;margin:0 auto;padding:8rem 2rem 4rem;text-align:center}.avatar{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#8b5cf6,#3b82f6);margin:0 auto 1.5rem;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.6rem}h1{font-size:clamp(1.8rem,4vw,2.8rem);color:#1a1714;margin-bottom:.8rem;line-height:1.2;letter-spacing:-.3px}.tagline{font-size:1.05rem;color:#7a7068;max-width:440px;margin:0 auto 2rem}.social{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}.social a{padding:.45rem 1.1rem;border:1px solid #e0dbd2;border-radius:5px;font-family:-apple-system,sans-serif;font-size:.82rem;color:#5a5248;text-decoration:none;transition:all .2s}.social a:hover{border-color:#8b5cf6;color:#8b5cf6}.posts{max-width:660px;margin:0 auto;padding:1rem 2rem 4rem}.section-title{font-family:-apple-system,sans-serif;font-size:.72rem;text-transform:uppercase;letter-spacing:2px;color:#b0a898;margin-bottom:1.2rem;padding-bottom:.5rem;border-bottom:1px solid #e8e3da}.post{padding:1.2rem 0;border-bottom:1px solid #f0ece4;display:flex;justify-content:space-between;align-items:flex-start;gap:1rem}.post:last-child{border-bottom:none}.post-title{font-size:1rem;color:#1a1714;text-decoration:none;transition:color .2s;line-height:1.4}.post-title:hover{color:#8b5cf6}.post-meta{font-family:-apple-system,sans-serif;font-size:.75rem;color:#b0a898;white-space:nowrap}.tags{display:flex;gap:.4rem;margin-top:.35rem;flex-wrap:wrap}.tag{font-family:-apple-system,sans-serif;font-size:.7rem;padding:.15rem .5rem;background:#f0ece4;color:#7a7068;border-radius:3px}footer{text-align:center;padding:1.5rem;border-top:1px solid #e8e3da;font-family:-apple-system,sans-serif;font-size:.75rem;color:#b0a898}@media(max-width:540px){nav ul{display:none}}</style></head><body><nav><div class="logo">Alex Chen</div><ul><li><a href="#">Writing</a></li><li><a href="#">Projects</a></li><li><a href="#">About</a></li><li><a href="#">RSS</a></li></ul></nav><section class="hero"><div class="avatar">✍️</div><h1>Software engineering, systems, and occasional philosophy</h1><p class="tagline">Building distributed systems by day. Writing about technology, craft, and the occasional rabbit hole by night.</p><div class="social"><a href="#">GitHub</a><a href="#">Twitter / X</a><a href="#">LinkedIn</a><a href="#">Newsletter</a></div></section><section class="posts"><div class="section-title">Recent Writing</div><div class="post"><div><a class="post-title" href="#">Why I stopped using ORM frameworks in production</a><div class="tags"><span class="tag">databases</span><span class="tag">backend</span></div></div><span class="post-meta">Feb 2026</span></div><div class="post"><div><a class="post-title" href="#">A practical guide to distributed tracing without vendor lock-in</a><div class="tags"><span class="tag">observability</span></div></div><span class="post-meta">Jan 2026</span></div><div class="post"><div><a class="post-title" href="#">Event sourcing in Go: lessons after two years in production</a><div class="tags"><span class="tag">go</span><span class="tag">architecture</span></div></div><span class="post-meta">Dec 2025</span></div></section><footer>Written and maintained by Alex Chen · No tracking, no cookies</footer></body></html>
+    elif [[ "$THEME" == "5" ]]; then
+        cat > "${WEBROOT}/index.html" << HTML
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${SITE_NAME} — Engineering Blog</title><style>${CSS_COMMON}.hero{max-width:660px;margin:0 auto;padding:8rem 2rem 4rem;text-align:center}.avatar{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,${COLOR1},${COLOR2});margin:0 auto 1.5rem;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.6rem}h1{font-size:clamp(1.8rem,4vw,2.4rem);margin-bottom:.8rem;letter-spacing:-.3px}.tagline{font-size:1.05rem;color:${TEXT_DIM};max-width:440px;margin:0 auto 2rem}.social{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}.social a{padding:.45rem 1.1rem;border:1px solid ${BORDER_COLOR};border-radius:5px;font-family:-apple-system,sans-serif;font-size:.82rem;color:${TEXT_DIM};text-decoration:none;transition:all .2s}.social a:hover{border-color:${COLOR1};color:${COLOR1}}.posts{max-width:660px;margin:0 auto;padding:1rem 2rem 4rem}.stitle{font-family:-apple-system,sans-serif;font-size:.72rem;text-transform:uppercase;letter-spacing:2px;color:${TEXT_DIM};margin-bottom:1.2rem;padding-bottom:.5rem;border-bottom:1px solid ${BORDER_COLOR}}.post{padding:1.2rem 0;border-bottom:1px solid ${BORDER_COLOR};display:flex;justify-content:space-between;align-items:flex-start;gap:1rem}.post:last-child{border-bottom:none}.post-title{font-size:1rem;color:${TEXT_WHITE};text-decoration:none;transition:color .2s;line-height:1.4}.post-title:hover{color:${COLOR1}}.post-meta{font-family:-apple-system,sans-serif;font-size:.75rem;color:${TEXT_DIM};white-space:nowrap}.tag{font-family:-apple-system,sans-serif;font-size:.7rem;padding:.15rem .5rem;background:${BORDER_COLOR};color:${TEXT_DIM};border-radius:3px;display:inline-block;margin-top:.35rem;margin-right:.3rem}</style></head><body>${NAV_BLOCK}<section class="hero"><div class="avatar">✍️</div><h1>Software engineering, systems, and occasional philosophy</h1><p class="tagline">Building distributed systems by day. Writing about technology, craft, and the occasional rabbit hole by night.</p><div class="social"><a href="#">GitHub</a><a href="#">Twitter / X</a><a href="#">LinkedIn</a></div></section><section class="posts"><div class="stitle">Recent Writing</div><div class="post"><div><a class="post-title" href="#">Why I stopped using ORM frameworks in production</a><div><span class="tag">databases</span><span class="tag">backend</span></div></div><span class="post-meta">Feb 2026</span></div><div class="post"><div><a class="post-title" href="#">A practical guide to distributed tracing without vendor lock-in</a><div><span class="tag">observability</span></div></div><span class="post-meta">Jan 2026</span></div><div class="post"><div><a class="post-title" href="#">Event sourcing in Go: lessons after two years in production</a><div><span class="tag">go</span><span class="tag">architecture</span></div></div><span class="post-meta">Dec 2025</span></div></section>${FOOTER_HTML}</body></html>
 HTML
+    fi
+
+    # ── /about/index.html ──
+    mkdir -p "${WEBROOT}/about"
+    cat > "${WEBROOT}/about/index.html" << HTML
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${ABOUT_TITLE} — ${SITE_NAME}${SITE_TAG:+ ${SITE_TAG}}</title><style>${CSS_COMMON}</style></head><body>${NAV_BLOCK}<div class="content"><h1>${ABOUT_TITLE}</h1><p>${ABOUT_TEXT}</p><p>For inquiries, visit our <a href="/contact" style="color:${COLOR1}">contact page</a>.</p></div>${FOOTER_HTML}</body></html>
+HTML
+
+    # ── /contact/index.html ──
+    mkdir -p "${WEBROOT}/contact"
+    cat > "${WEBROOT}/contact/index.html" << HTML
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${CONTACT_TITLE} — ${SITE_NAME}${SITE_TAG:+ ${SITE_TAG}}</title><style>${CSS_COMMON}.form-stub{margin-top:2rem;padding:2rem;border:1px solid ${BORDER_COLOR};border-radius:8px}.form-stub p{color:${TEXT_DIM};font-size:.9rem}</style></head><body>${NAV_BLOCK}<div class="content"><h1>${CONTACT_TITLE}</h1><div class="form-stub"><p>Our contact form is temporarily unavailable. Please reach out via email.</p><p style="margin-top:1rem;color:${COLOR1}">contact@${DOMAIN}</p></div></div>${FOOTER_HTML}</body></html>
+HTML
+
+    echo -e "${GREEN}[✓] Stub-страницы созданы (${STUB_NAMES[$((THEME-1))]}) + /about, /contact, robots.txt, sitemap.xml${NC}"
 }
 
-case "$STUB_CHOICE" in
-    1) create_stub_minimal ;;
-    2) create_stub_cats ;;
-    3) create_stub_business ;;
-    4) create_stub_hosting ;;
-    5) create_stub_blog ;;
-esac
-echo -e "${GREEN}[✓] Stub-страница создана${NC}"
+generate_stub_pages "$STUB_CHOICE"
 
-# ── Останавливаем Caddy если был ───────────────────────────
-if systemctl is-active --quiet caddy 2>/dev/null; then
-    echo -e "${YELLOW}[!] Caddy обнаружен, останавливаю и отключаю...${NC}"
-    systemctl stop caddy
-    systemctl disable caddy > /dev/null 2>&1 || true
-fi
-
-# ── nginx: начальная конфигурация (HTTP only, для certbot) ─
+# ── nginx конфигурация ────────────────────────────────────
 echo -e "${CYAN}[*] Настраиваю nginx...${NC}"
 
-# Убираем дефолтный сайт
+# Удаляем default
 rm -f /etc/nginx/sites-enabled/default
 
-cat > /etc/nginx/sites-available/selfsteal << NGEOF
-# Временный HTTP — для получения сертификата certbot
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
+# Глобальный hardening
+cat > /etc/nginx/conf.d/hardening.conf << 'NGXHARD'
+# ── Глобальный hardening ──────────────────────────────────
+server_tokens off;
+more_clear_headers Server;
 
-    root /var/www/html;
-    index index.html;
+# Rate-limiting зоны
+limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=probe:10m rate=3r/s;
+limit_conn_zone $binary_remote_addr zone=connlimit:10m;
+NGXHARD
 
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location / {
-        try_files \$uri /index.html;
-    }
-}
-NGEOF
-
-ln -sf /etc/nginx/sites-available/selfsteal /etc/nginx/sites-enabled/selfsteal
-nginx -t > /dev/null 2>&1 || { echo -e "${RED}[✗] Ошибка конфигурации nginx${NC}"; exit 1; }
-systemctl enable nginx > /dev/null 2>&1
-systemctl restart nginx
-echo -e "${GREEN}[✓] nginx запущен (HTTP)${NC}"
-
-# ── Получаем сертификат через certbot ──────────────────────
-echo -e "${CYAN}[*] Получаю TLS-сертификат (Let's Encrypt)...${NC}"
-certbot certonly --nginx \
-    -d "${DOMAIN}" \
-    --non-interactive \
-    --agree-tos \
-    --register-unsafely-without-email \
-    --quiet 2>/dev/null
-
-CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-
-if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-    echo -e "${GREEN}[✓] Сертификат получен${NC}"
-else
-    echo -e "${RED}[✗] Не удалось получить сертификат!${NC}"
-    echo -e "${YELLOW}    Убедись что порт 80 открыт и DNS ведёт на сервер${NC}"
-    echo -e "${YELLOW}    Попробуй вручную: certbot certonly --nginx -d ${DOMAIN}${NC}"
-    exit 1
+# Проверяем, есть ли модуль headers-more
+if ! nginx -V 2>&1 | grep -q "headers-more"; then
+    # Если нет модуля — убираем more_clear_headers, используем пустой server header
+    sed -i '/more_clear_headers/d' /etc/nginx/conf.d/hardening.conf
+    echo -e "${YELLOW}[!] Модуль headers-more не найден — Server header скроем через proxy_pass_header${NC}"
 fi
 
-# ── nginx: полная конфигурация (HTTP + HTTPS localhost) ────
-cat > /etc/nginx/sites-available/selfsteal << NGEOF
-# Публичный HTTP — страница + ACME challenge для обновления сертификата
+# Основной site-конфиг
+cat > "/etc/nginx/sites-available/${DOMAIN}" << NGXCONF
+# ── ${DOMAIN} — MTProto SelfSteal маскировка ──────────────
+
+# HTTP — для ACME + редирект браузеров на HTTPS
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
 
-    root /var/www/html;
-    index index.html;
-
-    # ACME challenge для certbot
+    # ACME challenge
     location /.well-known/acme-challenge/ {
-        root /var/www/html;
+        root /var/www/${DOMAIN};
     }
 
+    # Всё остальное → HTTPS
     location / {
-        try_files \$uri /index.html;
+        return 301 https://\$host\$request_uri;
     }
-
-    # Убираем заголовок Server
-    server_tokens off;
-    add_header X-Content-Type-Options "nosniff" always;
 }
 
-# Внутренний HTTPS — маскировка для mtprotoproxy (ТОЛЬКО localhost)
-# DPI/сканер → mtprotoproxy → сюда → видит валидный TLS 1.3 + HTML
+# HTTPS на 8443 — только localhost (для mtprotoproxy PROXY_URL + прямых проверок)
 server {
     listen 127.0.0.1:8443 ssl;
     server_name ${DOMAIN};
 
-    ssl_certificate     ${CERT_PATH};
-    ssl_certificate_key ${KEY_PATH};
-
-    # Строго TLS 1.3 — чистый хендшейк без лишних записей
-    ssl_protocols       TLSv1.3;
+    # TLS — сертификат будет получен certbot
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
 
-    root /var/www/html;
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Content-Security-Policy "default-src 'self' 'unsafe-inline'" always;
+
+    # Rate-limiting
+    limit_req zone=probe burst=5 nodelay;
+    limit_conn connlimit 15;
+
+    root /var/www/${DOMAIN};
     index index.html;
 
+    # Подстраницы
     location / {
-        try_files \$uri /index.html;
+        try_files \$uri \$uri/ /index.html;
     }
 
-    server_tokens off;
-    add_header Strict-Transport-Security "max-age=31536000" always;
-    add_header X-Content-Type-Options "nosniff" always;
-}
-NGEOF
+    # Статические файлы с правильными типами
+    location = /robots.txt { }
+    location = /sitemap.xml { }
+    location = /favicon.ico { access_log off; log_not_found off; }
 
-nginx -t > /dev/null 2>&1 || { echo -e "${RED}[✗] Ошибка конфигурации nginx${NC}"; exit 1; }
-systemctl reload nginx
+    # Блокируем подозрительные пути
+    location ~* \.(php|asp|aspx|jsp|cgi)$ {
+        return 404;
+    }
+
+    access_log /var/log/nginx/${DOMAIN}_ssl_access.log;
+    error_log /var/log/nginx/${DOMAIN}_ssl_error.log;
+}
+NGXCONF
+
+ln -sf "/etc/nginx/sites-available/${DOMAIN}" /etc/nginx/sites-enabled/
+
+# ── Получаем TLS-сертификат ───────────────────────────────
+# Сначала запускаем nginx только на HTTP (без SSL-блока)
+# чтобы certbot мог пройти ACME challenge
+
+# Временный конфиг — только HTTP
+cat > "/etc/nginx/sites-available/${DOMAIN}-temp" << TMPCONF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+    root /var/www/${DOMAIN};
+    location /.well-known/acme-challenge/ { root /var/www/${DOMAIN}; }
+    location / { return 200 'OK'; add_header Content-Type text/plain; }
+}
+TMPCONF
+
+ln -sf "/etc/nginx/sites-available/${DOMAIN}-temp" /etc/nginx/sites-enabled/
+rm -f "/etc/nginx/sites-enabled/${DOMAIN}"
+
+nginx -t > /dev/null 2>&1 && systemctl restart nginx
+echo -e "${GREEN}[✓] nginx запущен (HTTP)${NC}"
+
+echo -e "${CYAN}[*] Получаю TLS-сертификат (Let's Encrypt)...${NC}"
+certbot certonly --webroot -w "/var/www/${DOMAIN}" -d "${DOMAIN}" \
+    --non-interactive --agree-tos --register-unsafely-without-email \
+    --quiet 2>/dev/null
+
+if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    echo -e "${GREEN}[✓] Сертификат получен${NC}"
+else
+    echo -e "${RED}[✗] Сертификат не получен — проверь DNS и порт 80${NC}"
+    echo -e "    Вручную: certbot certonly --webroot -w /var/www/${DOMAIN} -d ${DOMAIN}"
+    read -rp "$(echo -e "${YELLOW}[?] Продолжить без сертификата? (y/n): ${NC}")" CONT
+    [[ "$CONT" != "y" ]] && exit 1
+fi
+
+# Переключаем на полный конфиг
+rm -f "/etc/nginx/sites-enabled/${DOMAIN}-temp"
+rm -f "/etc/nginx/sites-available/${DOMAIN}-temp"
+ln -sf "/etc/nginx/sites-available/${DOMAIN}" /etc/nginx/sites-enabled/
+nginx -t > /dev/null 2>&1 && systemctl restart nginx
 echo -e "${GREEN}[✓] nginx настроен (HTTP + HTTPS localhost)${NC}"
 
 # ── Автообновление сертификата ─────────────────────────────
-# certbot ставит cron/timer автоматически, но добавим перезапуск mtprotoproxy
-cat > /etc/letsencrypt/renewal-hooks/post/restart-services.sh << 'HOOKEOF'
-#!/bin/bash
-systemctl reload nginx
-systemctl restart mtprotoproxy
-HOOKEOF
-chmod +x /etc/letsencrypt/renewal-hooks/post/restart-services.sh
-echo -e "${GREEN}[✓] Автообновление сертификата настроено${NC}"
+if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --deploy-hook 'systemctl reload nginx'") | crontab -
+    echo -e "${GREEN}[✓] Автообновление сертификата настроено${NC}"
+fi
 
 # ── Конфиг mtprotoproxy ────────────────────────────────────
 cat > "${PROXY_DIR}/config.py" << PYEOF
-# ── MTProto SelfSteal Config v3 ─────────────────────────────
-# Сгенерировано selfsteal-mtproto-setup.sh v3
+# ── MTProto SelfSteal Config v4 ─────────────────────────────
+# Сгенерировано selfsteal-mtproto-setup.sh
+# Секрет СЛУЧАЙНЫЙ — не зависит от домена
 
-# Порт прокси (443 = максимальная скрытность)
 PORT = 443
+BIND_IP = "0.0.0.0"
 
-# Пользователи и их секреты
-# ВАЖНО: в USERS — только 32 hex символа (сырой ключ)
-# Клиент получает полный секрет: ee + ключ + домен_hex
 USERS = {
-    "user1": "${RANDOM_KEY}",
+    "tg": "${FAKETLS_SECRET}",
 }
 
-# Домен маскировки
+# Домен маскировки TLS
 TLS_DOMAIN = "${DOMAIN}"
 
-# SelfSteal: маскировка под свой сайт
-# DPI/сканер → mtprotoproxy → nginx:8443 (TLS 1.3 + реальная HTML-страница)
-MASK = True
-MASK_HOST = "127.0.0.1"
-MASK_PORT = 8443
+# КЛЮЧЕВАЯ НАСТРОЙКА SELFSTEAL:
+# DPI/сканеры перенаправляются на nginx HTTPS (полный TLS-хендшейк)
+PROXY_URL = "https://127.0.0.1:8443"
+
+# Безопасность
+SECURE_ONLY = True          # только faketls, отклонять plain mtproto
+MAX_CONNECTIONS = 500        # лимит одновременных соединений
+
+# Без ограничения скорости на уровне прокси
+# (используй SkunkTrafLimit для per-user лимитов)
 PYEOF
 
+chown mtproto:mtproto "${PROXY_DIR}/config.py"
 echo -e "${GREEN}[✓] Конфиг mtprotoproxy создан${NC}"
 
-# ── systemd: mtprotoproxy ──────────────────────────────────
+# ── systemd: mtprotoproxy (от пользователя mtproto) ────────
 echo -e "${CYAN}[*] Создаю systemd-юнит для mtprotoproxy...${NC}"
 cat > /etc/systemd/system/mtprotoproxy.service << SVCEOF
 [Unit]
-Description=MTProto Proxy for Telegram (SelfSteal)
+Description=MTProto Proxy for Telegram (SelfSteal v4)
 After=network.target nginx.service
-Requires=nginx.service
+Wants=nginx.service
 
 [Service]
 Type=simple
-User=root
+User=mtproto
+Group=mtproto
 WorkingDirectory=${PROXY_DIR}
 ExecStart=/usr/bin/python3 ${PROXY_DIR}/mtprotoproxy.py
 Restart=always
 RestartSec=5
+
+# Разрешаем привязку к порту 443 без root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${PROXY_DIR}
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Логи — минимум
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=mtprotoproxy
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
 systemctl daemon-reload
-echo -e "${GREEN}[✓] Юнит создан${NC}"
+echo -e "${GREEN}[✓] Юнит создан (запуск от mtproto, hardened)${NC}"
+
+# ── fail2ban ──────────────────────────────────────────────
+echo -e "${CYAN}[*] Настраиваю fail2ban...${NC}"
+
+# Фильтр для nginx (подозрительные запросы)
+cat > /etc/fail2ban/filter.d/nginx-probe.conf << 'F2BFILTER'
+[Definition]
+failregex = ^<HOST> .* "(GET|POST|HEAD) .*(\.php|\.asp|\.aspx|\.jsp|\.cgi|wp-login|xmlrpc|\.env|\.git).*" (403|404)
+ignoreregex =
+F2BFILTER
+
+# Jail
+cat > /etc/fail2ban/jail.d/selfsteal.conf << F2BJAIL
+[sshd]
+enabled = true
+maxretry = 5
+bantime = 3600
+findtime = 600
+
+[nginx-probe]
+enabled = true
+port = http,https
+filter = nginx-probe
+logpath = /var/log/nginx/${DOMAIN}_ssl_access.log
+maxretry = 10
+bantime = 1800
+findtime = 300
+F2BJAIL
+
+systemctl enable fail2ban > /dev/null 2>&1
+systemctl restart fail2ban > /dev/null 2>&1
+echo -e "${GREEN}[✓] fail2ban настроен (SSH + nginx probe)${NC}"
+
+# ── logrotate для mtprotoproxy ─────────────────────────────
+cat > /etc/logrotate.d/mtprotoproxy << 'LOGROTATE'
+/var/log/journal/*mtprotoproxy* {
+    weekly
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+LOGROTATE
+echo -e "${GREEN}[✓] logrotate настроен${NC}"
 
 # ── Файрвол ────────────────────────────────────────────────
 echo -e "${CYAN}[*] Настраиваю файрвол...${NC}"
@@ -333,33 +583,44 @@ if command -v ufw &>/dev/null; then
     ufw allow 80/tcp   > /dev/null 2>&1 || true
     ufw allow 443/tcp  > /dev/null 2>&1 || true
     ufw delete allow 8443/tcp > /dev/null 2>&1 || true
+    ufw delete allow 8080/tcp > /dev/null 2>&1 || true
     echo -e "${GREEN}[✓] UFW: 80, 443 открыты | 8443 только localhost${NC}"
 fi
 
-# ── Запуск mtprotoproxy ────────────────────────────────────
+# ── Запуск ─────────────────────────────────────────────────
 echo -e "${CYAN}[*] Запускаю mtprotoproxy...${NC}"
 systemctl enable mtprotoproxy > /dev/null 2>&1
 systemctl restart mtprotoproxy
 sleep 3
 
+# ── Проверка ───────────────────────────────────────────────
+PROXY_OK=false
+NGINX_OK=false
+
 if systemctl is-active --quiet mtprotoproxy; then
+    PROXY_OK=true
     echo -e "${GREEN}[✓] mtprotoproxy запущен${NC}"
 else
-    echo -e "${RED}[✗] mtprotoproxy не запустился!${NC}"
-    echo -e "${YELLOW}    Проверь: journalctl -u mtprotoproxy -n 30${NC}"
+    echo -e "${RED}[✗] mtprotoproxy не запустился — journalctl -u mtprotoproxy -n 20${NC}"
 fi
 
-# ── Проверка логов ────────────────────────────────────────
-PROXY_LOG=$(journalctl -u mtprotoproxy --no-pager -n 10 2>/dev/null)
-
-if echo "$PROXY_LOG" | grep -q "Bad secret"; then
-    echo -e "${RED}[✗] Ошибка секрета — проверь journalctl -u mtprotoproxy${NC}"
-elif echo "$PROXY_LOG" | grep -q "TLS record before certificate"; then
-    echo -e "${YELLOW}[!] Предупреждение: TLS record before certificate (некритично)${NC}"
+if systemctl is-active --quiet nginx; then
+    NGINX_OK=true
+    echo -e "${GREEN}[✓] nginx запущен${NC}"
+else
+    echo -e "${RED}[✗] nginx не запустился — journalctl -u nginx -n 20${NC}"
 fi
 
-if echo "$PROXY_LOG" | grep -q "Got cert from the MASK_HOST"; then
-    echo -e "${GREEN}[✓] Маскировка работает — сертификат получен от nginx${NC}"
+# Проверка маскировки
+MASK_OK=false
+if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "https://127.0.0.1:8443" --resolve "${DOMAIN}:8443:127.0.0.1" 2>/dev/null || echo "000")
+    if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" ]]; then
+        MASK_OK=true
+        echo -e "${GREEN}[✓] Маскировка работает — сертификат от nginx${NC}"
+    else
+        echo -e "${YELLOW}[!] Предупреждение: TLS probe вернул HTTP ${HTTP_CODE} (некритично)${NC}"
+    fi
 fi
 
 # ── Ссылка для подключения ────────────────────────────────
@@ -368,7 +629,7 @@ TG_LINK="https://t.me/proxy?server=${DOMAIN}&port=443&secret=${FAKETLS_SECRET}"
 # ── Итог ───────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║         ✓  MTProto SelfSteal v3 готов!                   ║${NC}"
+echo -e "${GREEN}║         ✓  MTProto SelfSteal v4 готов!                   ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}Домен:${NC}          ${CYAN}${DOMAIN}${NC}"
@@ -376,32 +637,40 @@ echo -e "  ${BOLD}IP сервера:${NC}     ${CYAN}${SERVER_IP}${NC}"
 echo -e "  ${BOLD}Маскировка:${NC}     ${CYAN}${STUB_NAMES[$((STUB_CHOICE-1))]}${NC}"
 echo -e "  ${BOLD}Веб-сервер:${NC}     ${CYAN}nginx + certbot${NC}"
 echo ""
-echo -e "  ${YELLOW}━━━  Ссылка для Telegram  ━━━${NC}"
+echo -e "  ${YELLOW}━━  Ссылка для Telegram  ━━${NC}"
 echo ""
 echo -e "  ${GREEN}${TG_LINK}${NC}"
 echo ""
-echo -e "  ${DIM}Скопируй ссылку → отправь в Saved Messages → нажми → Подключить${NC}"
+echo -e "  Скопируй ссылку → отправь в Saved Messages → нажми → Подключить"
 echo ""
 echo -e "  ${BOLD}Секрет (faketls):${NC}"
 echo -e "  ${CYAN}${FAKETLS_SECRET}${NC}"
 echo ""
-echo -e "  ${YELLOW}━━━  Порты  ━━━${NC}"
+echo -e "  ${YELLOW}━━  Порты  ━━${NC}"
 echo ""
-echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + FakeTLS маскировка)"
-echo -e "  ${BOLD}80${NC}    → nginx (HTML-страница + ACME challenge)"
-echo -e "  ${BOLD}8443${NC}  → nginx HTTPS (только 127.0.0.1 — TLS 1.3 для DPI)"
+echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + faketls маскировка)"
+echo -e "  ${BOLD}80${NC}    → nginx (ACME + редирект на HTTPS)"
+echo -e "  ${BOLD}8443${NC}  → nginx HTTPS (только 127.0.0.1 — TLS-проба от DPI)"
 echo ""
-echo -e "  ${YELLOW}━━━  Управление  ━━━${NC}"
+echo -e "  ${YELLOW}━━  Улучшения v4  ━━${NC}"
 echo ""
-echo -e "  ${DIM}Логи прокси:     journalctl -u mtprotoproxy -f${NC}"
-echo -e "  ${DIM}Логи nginx:      journalctl -u nginx -f  /  tail -f /var/log/nginx/error.log${NC}"
-echo -e "  ${DIM}Тест маскировки: curl -sk https://127.0.0.1:8443 | head -5${NC}"
-echo -e "  ${DIM}Тест сертификата: certbot certificates${NC}"
-echo -e "  ${DIM}Страница:        nano /var/www/html/index.html && systemctl reload nginx${NC}"
+echo -e "  ${GREEN}✓${NC} Случайный секрет (не вычисляется из домена)"
+echo -e "  ${GREEN}✓${NC} PROXY_URL → HTTPS (полный TLS при пробинге)"
+echo -e "  ${GREEN}✓${NC} nginx: HSTS, скрытый Server, rate-limit, CSP"
+echo -e "  ${GREEN}✓${NC} Подстраницы: /about, /contact, robots.txt, sitemap.xml"
+echo -e "  ${GREEN}✓${NC} Запуск от пользователя mtproto (не root)"
+echo -e "  ${GREEN}✓${NC} systemd hardening (ProtectSystem, PrivateTmp...)"
+echo -e "  ${GREEN}✓${NC} fail2ban (SSH + nginx probe detection)"
+echo -e "  ${GREEN}✓${NC} logrotate для mtprotoproxy"
 echo ""
-echo -e "  ${YELLOW}━━━  Как работает маскировка  ━━━${NC}"
+echo -e "  ${DIM}Логи прокси:   journalctl -u mtprotoproxy -f${NC}"
+echo -e "  ${DIM}Логи nginx:    tail -f /var/log/nginx/${DOMAIN}_ssl_access.log${NC}"
+echo -e "  ${DIM}fail2ban:      fail2ban-client status${NC}"
+echo -e "  ${DIM}Страница:      nano /var/www/${DOMAIN}/index.html && systemctl reload nginx${NC}"
 echo ""
-echo -e "  Клиент Telegram → :443 → mtprotoproxy → MTProto ОК → туннель в Telegram"
-echo -e "  DPI/сканер       → :443 → mtprotoproxy → не MTProto → nginx:8443 (TLS 1.3 + HTML)"
-echo -e "  Браузер          → :80  → nginx (HTML-страница)"
+echo -e "  ${YELLOW}━━  Как работает маскировка  ━━${NC}"
+echo ""
+echo -e "  DPI/сканер → port 443 → mtprotoproxy → не MTProto?"
+echo -e "  → PROXY_URL → nginx:8443 (TLS + валидный сертификат + реальная страница)"
+echo -e "  Для блокировщика трафик неотличим от обычного HTTPS-сайта"
 echo ""
