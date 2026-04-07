@@ -97,7 +97,7 @@ fail2ban-client status nginx-probe
 
 ```bash
 # Сгенерировать faketls-секрет для нового домена
-NEW_SECRET="ee$(echo -n 'newdomain.com' | xxd -p | tr -d '\n')"
+NEW_SECRET="ee$(python3 -c "print('newdomain.com'.encode().hex())")"
 echo "$NEW_SECRET"
 
 # Вставить в конфиг
