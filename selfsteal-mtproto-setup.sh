@@ -1,17 +1,17 @@
 #!/bin/bash
 
 # ============================================================
-#  MTPSSteal v5 — mtproto.zig + DPI Evasion
+#  MTProto SelfSteal Installer v3
+#  Telegram MTProto Proxy + nginx (маскировка под свой домен)
 #
-#  Высокопроизводительный MTProto прокси с полной DPI-защитой:
-#    — mtproto.zig: 126 КБ, ~120 КБ RAM, 0 зависимостей
-#    — FakeTLS 1.3, Split-TLS, DRS, Anti-replay
-#    — TCPMSS=88: фрагментация ClientHello на 6 TCP-пакетов
-#    — zapret/nfqws: TCP desync (fake packets + TTL spoofing)
-#    — Маскировка: forward на реальный сайт при DPI-пробе
-#    — IPv6 auto-hopping через Cloudflare (опционально)
+#  Архитектура:
+#    Port 443  → mtprotoproxy (faketls)
+#                  ├─ MTProto клиент → туннель в Telegram
+#                  └─ DPI / сканер   → nginx:8443 (127.0.0.1)
+#                                          └─ реальный сайт + TLS 1.3
+#    Port 80   → nginx (HTML-страница + ACME challenge)
 #
-#  Требования: Debian/Ubuntu 20.04+, root, домен с A-записью
+#  Требования: Debian/Ubuntu, root, домен с A-записью на сервер
 # ============================================================
 
 set -e
@@ -27,49 +27,39 @@ NC='\033[0m'
 echo -e "${CYAN}"
 cat << 'BANNER'
  ╔══════════════════════════════════════════════════════════╗
- ║       MTPSSteal v5 — mtproto.zig + DPI Evasion          ║
- ║       Высокопроизводительный MTProto прокси              ║
+ ║       MTProto SelfSteal Installer  v3                   ║
+ ║       Telegram прокси + nginx (маскировка домена)        ║
  ╚══════════════════════════════════════════════════════════╝
 BANNER
 echo -e "${NC}"
 
+# ── Root ──────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}[✗] Запусти от root: sudo bash $0${NC}"
     exit 1
 fi
 
 # ── Домен ─────────────────────────────────────────────────
-read -rp "$(echo -e "${YELLOW}[?] Твой домен (например, proxy.example.com): ${NC}")" DOMAIN
+read -rp "$(echo -e "${YELLOW}[?] Твой домен (например, example.com): ${NC}")" DOMAIN
 DOMAIN=$(echo "$DOMAIN" | xargs | tr '[:upper:]' '[:lower:]')
 [[ -z "$DOMAIN" ]] && { echo -e "${RED}[✗] Домен не может быть пустым${NC}"; exit 1; }
 
-# ── Домен маскировки ──────────────────────────────────────
+# ── Выбор stub-страницы ────────────────────────────────────
 echo ""
-echo -e "${BOLD}  Домен маскировки (реальный сайт для перенаправления DPI-проб):${NC}"
+echo -e "${BOLD}  Выбери маскировочную страницу:${NC}"
 echo ""
-echo -e "  ${CYAN}1)${NC} wb.ru               ${DIM}— Wildberries, естественный трафик из РФ${NC}"
-echo -e "  ${CYAN}2)${NC} www.ozon.ru         ${DIM}— Ozon, российский e-commerce${NC}"
-echo -e "  ${CYAN}3)${NC} www.avito.ru        ${DIM}— Avito${NC}"
-echo -e "  ${CYAN}4)${NC} www.google.com      ${DIM}— универсальный${NC}"
-echo -e "  ${CYAN}5)${NC} Свой домен          ${DIM}— ввести вручную${NC}"
+echo -e "  ${CYAN}1)${NC} Минимальный 404     ${DIM}— тёмный, лаконичный${NC}"
+echo -e "  ${CYAN}2)${NC} Котики 404          ${DIM}— весёлый, с анимацией${NC}"
+echo -e "  ${CYAN}3)${NC} Tech-компания        ${DIM}— корпоративный лендинг${NC}"
+echo -e "  ${CYAN}4)${NC} Облачный хостинг     ${DIM}— SaaS / хостинг стиль${NC}"
+echo -e "  ${CYAN}5)${NC} Личный блог          ${DIM}— инженерный блог${NC}"
 echo ""
-read -rp "$(echo -e "${YELLOW}[?] Выбор (1-5) [по умолчанию: 1]: ${NC}")" MASK_CHOICE
-MASK_CHOICE=${MASK_CHOICE:-1}
+read -rp "$(echo -e "${YELLOW}[?] Выбор (1-5) [по умолчанию: 1]: ${NC}")" STUB_CHOICE
+STUB_CHOICE=${STUB_CHOICE:-1}
+[[ ! "$STUB_CHOICE" =~ ^[1-5]$ ]] && STUB_CHOICE=1
 
-case "$MASK_CHOICE" in
-    1) TLS_DOMAIN="wb.ru" ;;
-    2) TLS_DOMAIN="www.ozon.ru" ;;
-    3) TLS_DOMAIN="www.avito.ru" ;;
-    4) TLS_DOMAIN="www.google.com" ;;
-    5) read -rp "$(echo -e "${YELLOW}[?] Домен маскировки: ${NC}")" TLS_DOMAIN ;;
-    *) TLS_DOMAIN="wb.ru" ;;
-esac
-echo -e "${GREEN}[✓] Маскировка под: ${TLS_DOMAIN}${NC}"
-
-# ── zapret ────────────────────────────────────────────────
-echo ""
-read -rp "$(echo -e "${YELLOW}[?] Установить zapret/nfqws для TCP desync? (y/n) [y]: ${NC}")" INSTALL_ZAPRET
-INSTALL_ZAPRET=${INSTALL_ZAPRET:-y}
+STUB_NAMES=("Минимальный 404" "Котики 404" "Tech-компания" "Облачный хостинг" "Личный блог")
+echo -e "${GREEN}[✓] Выбрано: ${STUB_NAMES[$((STUB_CHOICE-1))]}${NC}"
 
 # ── DNS-проверка ──────────────────────────────────────────
 echo ""
@@ -78,7 +68,8 @@ SERVER_IP=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null || echo "unknown")
 DOMAIN_IP=$(dig +short "$DOMAIN" A 2>/dev/null | head -1)
 
 if [[ -z "$DOMAIN_IP" ]]; then
-    echo -e "${RED}[✗] ${DOMAIN} не резолвится — добавь A-запись: ${DOMAIN} → ${SERVER_IP}${NC}"
+    echo -e "${RED}[✗] ${DOMAIN} не резолвится${NC}"
+    echo -e "    Добавь A-запись: ${CYAN}${DOMAIN} → ${SERVER_IP}${NC}"
     read -rp "$(echo -e "${YELLOW}[?] Продолжить? (y/n): ${NC}")" CONT
     [[ "$CONT" != "y" ]] && exit 1
 elif [[ "$SERVER_IP" == "$DOMAIN_IP" ]]; then
@@ -89,326 +80,328 @@ else
     [[ "$CONT" != "y" ]] && exit 1
 fi
 
-# ── Остановка старого mtprotoproxy ────────────────────────
-echo -e "${CYAN}[*] Останавливаю старый прокси (если есть)...${NC}"
-systemctl stop mtprotoproxy 2>/dev/null || true
-systemctl disable mtprotoproxy 2>/dev/null || true
-rm -f /etc/systemd/system/mtprotoproxy.service
-systemctl stop mtproto-proxy 2>/dev/null || true
-echo -e "${GREEN}[✓] Старый прокси остановлен${NC}"
-
 # ── Зависимости ───────────────────────────────────────────
 echo -e "${CYAN}[*] Устанавливаю зависимости...${NC}"
 apt update -qq > /dev/null 2>&1
-apt install -y git curl dnsutils ufw fail2ban xz-utils build-essential openssl python3 > /dev/null 2>&1
-echo -e "${GREEN}[✓] Зависимости установлены${NC}"
+apt install -y python3 python3-pip git curl dnsutils ufw nginx certbot python3-certbot-nginx > /dev/null 2>&1
+pip install cryptography --break-system-packages > /dev/null 2>&1 || true
 
-# ── Zig ───────────────────────────────────────────────────
-ZIG_VERSION="0.15.2"
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)  ZIG_ARCH="x86_64" ;;
-    aarch64) ZIG_ARCH="aarch64" ;;
-    *) echo -e "${RED}[✗] Неподдерживаемая архитектура: ${ARCH}${NC}"; exit 1 ;;
+# ── Генерация секрета ──────────────────────────────────────
+# В config.py → только 32-hex ключ (RANDOM_KEY)
+# Для клиента → "ee" + ключ + домен_hex (FAKETLS_SECRET)
+RANDOM_KEY=$(python3 -c "import os; print(os.urandom(16).hex())")
+DOMAIN_HEX=$(python3 -c "print('${DOMAIN}'.encode().hex())")
+FAKETLS_SECRET="ee${RANDOM_KEY}${DOMAIN_HEX}"
+echo -e "${GREEN}[✓] FakeTLS-секрет сгенерирован (содержит домен ${DOMAIN})${NC}"
+
+# ── Установка mtprotoproxy ─────────────────────────────────
+echo -e "${CYAN}[*] Устанавливаю mtprotoproxy (stable)...${NC}"
+PROXY_DIR="/opt/mtprotoproxy"
+
+if [[ -d "$PROXY_DIR" ]]; then
+    echo -e "${YELLOW}[!] mtprotoproxy уже установлен, обновляю...${NC}"
+    git -C "$PROXY_DIR" fetch --all -q 2>/dev/null || true
+    git -C "$PROXY_DIR" checkout stable -q 2>/dev/null || true
+    git -C "$PROXY_DIR" pull -q 2>/dev/null || true
+else
+    git clone -q -b stable https://github.com/alexbers/mtprotoproxy.git "$PROXY_DIR"
+fi
+echo -e "${GREEN}[✓] mtprotoproxy готов (stable)${NC}"
+
+# ── Stub-страницы ─────────────────────────────────────────
+mkdir -p /var/www/html
+
+create_stub_minimal() {
+cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404 – Not Found</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#080b10;color:#9ba3b8;display:flex;justify-content:center;align-items:center;min-height:100vh}.wrap{text-align:center;padding:2rem}h1{font-size:clamp(5rem,18vw,11rem);font-weight:800;letter-spacing:-.04em;background:linear-gradient(135deg,#5b7cf6,#9b5bf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;animation:flicker 4s ease-in-out infinite}p{margin-top:.8rem;font-size:.95rem;color:#424860}@keyframes flicker{0%,100%{opacity:1}48%{opacity:1}50%{opacity:.7}52%{opacity:1}96%{opacity:1}98%{opacity:.5}99%{opacity:1}}</style></head><body><div class="wrap"><h1>404</h1><p>The resource you requested does not exist on this server.</p></div></body></html>
+HTML
+}
+
+create_stub_cats() {
+cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404 – Oops!</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#160f22;color:#d0c4e8;display:flex;justify-content:center;align-items:center;min-height:100vh;overflow:hidden}.bg{position:fixed;inset:0;overflow:hidden;pointer-events:none}.bg span{position:absolute;font-size:1.6rem;opacity:.05;animation:fall linear infinite}.bg span:nth-child(1){left:8%;animation-duration:14s}.bg span:nth-child(2){left:25%;animation-duration:18s;animation-delay:3s}.bg span:nth-child(3){left:50%;animation-duration:16s;animation-delay:7s}.bg span:nth-child(4){left:72%;animation-duration:20s;animation-delay:1s}.bg span:nth-child(5){left:90%;animation-duration:13s;animation-delay:5s}@keyframes fall{from{top:-60px}to{top:110%}}.wrap{text-align:center;padding:2rem;position:relative;z-index:1}.emoji{font-size:5rem;animation:bob 3s ease-in-out infinite;display:block;margin-bottom:1rem}@keyframes bob{0%,100%{transform:translateY(0) rotate(-3deg)}50%{transform:translateY(-12px) rotate(3deg)}}h1{font-size:clamp(4rem,14vw,8rem);font-weight:800;background:linear-gradient(135deg,#ff6eb4,#b46aff,#6a9fff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1}.msg{font-size:1.1rem;color:#9b80c4;margin-top:.6rem}.paws{margin-top:1.5rem;font-size:1.3rem;letter-spacing:8px;opacity:.4}</style></head><body><div class="bg"><span>🐱</span><span>😸</span><span>🐈</span><span>😺</span><span>😻</span></div><div class="wrap"><span class="emoji">😿</span><h1>404</h1><p class="msg">The cat knocked this page off the table.</p><div class="paws">🐾 🐾 🐾</div></div></body></html>
+HTML
+}
+
+create_stub_business() {
+cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NovaTech Solutions</title><style>*{margin:0;padding:0;box-sizing:border-box}:root{--bg:#090c13;--s:#0f1320;--b:#1b2035;--a:#4e79f6;--a2:#7b54f5;--t:#b0b8cc;--td:#4a5168;--w:#e8ecf5}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--t);overflow-x:hidden}nav{position:fixed;top:0;width:100%;padding:1.1rem 3rem;display:flex;justify-content:space-between;align-items:center;z-index:10;backdrop-filter:blur(16px);background:rgba(9,12,19,.75);border-bottom:1px solid var(--b)}.logo{font-size:1.25rem;font-weight:800;color:var(--w)}.logo span{color:var(--a)}nav ul{list-style:none;display:flex;gap:1.8rem}nav a{color:var(--td);text-decoration:none;font-size:.88rem;transition:color .25s}nav a:hover{color:var(--w)}.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:6rem 2rem 4rem;text-align:center;position:relative}.glow{position:absolute;width:400px;height:400px;border-radius:50%;filter:blur(100px);opacity:.1;pointer-events:none}.g1{background:var(--a);top:-80px;left:-80px}.g2{background:var(--a2);bottom:-80px;right:-80px}.badge{display:inline-block;padding:.35rem .9rem;border:1px solid var(--b);border-radius:50px;font-size:.75rem;color:var(--a);margin-bottom:1.8rem;letter-spacing:1.2px;text-transform:uppercase}h1{font-size:clamp(2.2rem,5.5vw,4rem);color:var(--w);font-weight:800;line-height:1.1;margin-bottom:1.3rem}h1 em{font-style:normal;background:linear-gradient(135deg,var(--a),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.sub{font-size:1.05rem;color:var(--td);max-width:520px;margin:0 auto 2.2rem;line-height:1.65}.btns{display:flex;gap:.8rem;justify-content:center}.btn{padding:.75rem 1.7rem;border-radius:7px;font-size:.9rem;font-weight:600;text-decoration:none;border:none;font-family:inherit;transition:all .25s;cursor:pointer}.btn-p{background:linear-gradient(135deg,var(--a),var(--a2));color:#fff}.btn-p:hover{transform:translateY(-2px)}.btn-o{background:transparent;color:var(--t);border:1px solid var(--b)}.btn-o:hover{border-color:var(--a);color:var(--w)}.stats{display:flex;gap:2.5rem;justify-content:center;margin-top:3.5rem;padding-top:2.5rem;border-top:1px solid var(--b);flex-wrap:wrap}.stat-n{font-size:2rem;font-weight:800;color:var(--w)}.stat-l{font-size:.8rem;color:var(--td);margin-top:.25rem}footer{text-align:center;padding:1.8rem;border-top:1px solid var(--b);font-size:.78rem;color:var(--td)}@media(max-width:580px){nav ul{display:none}}</style></head><body><nav><div class="logo">Nova<span>Tech</span></div><ul><li><a href="#">Solutions</a></li><li><a href="#">About</a></li><li><a href="#">Pricing</a></li><li><a href="#">Contact</a></li></ul></nav><section class="hero"><div class="glow g1"></div><div class="glow g2"></div><div><div class="badge">Digital Infrastructure Partner</div><h1>Building the <em>future</em> of cloud infrastructure</h1><p class="sub">We help companies scale with modern cloud-native solutions, enterprise-grade security, and zero-downtime deployments.</p><div class="btns"><a class="btn btn-p" href="#">Get Started</a><a class="btn btn-o" href="#">Learn More</a></div><div class="stats"><div><div class="stat-n">500+</div><div class="stat-l">Enterprise Clients</div></div><div><div class="stat-n">99.9%</div><div class="stat-l">Uptime SLA</div></div><div><div class="stat-n">24/7</div><div class="stat-l">Expert Support</div></div></div></div></section><footer>&copy; 2026 NovaTech Solutions. All rights reserved.</footer></body></html>
+HTML
+}
+
+create_stub_hosting() {
+cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VortexHost — Lightning Fast Hosting</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif;background:#04060d;color:#a8b4cc;overflow-x:hidden}.orbs{position:fixed;inset:0;pointer-events:none;overflow:hidden}.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:.08}.orb1{width:500px;height:500px;background:#00d4ff;top:-150px;left:-100px;animation:drift1 20s ease-in-out infinite}.orb2{width:400px;height:400px;background:#0040ff;bottom:-100px;right:-100px;animation:drift2 18s ease-in-out infinite}@keyframes drift1{0%,100%{transform:translate(0,0)}50%{transform:translate(60px,40px)}}@keyframes drift2{0%,100%{transform:translate(0,0)}50%{transform:translate(-40px,-60px)}}nav{position:fixed;top:0;width:100%;padding:1rem 2.5rem;display:flex;justify-content:space-between;align-items:center;z-index:10;background:rgba(4,6,13,.8);backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.05)}.logo{font-weight:800;font-size:1.2rem;color:#fff}.logo span{color:#00d4ff}nav ul{list-style:none;display:flex;gap:1.6rem}nav a{color:#5a6a82;text-decoration:none;font-size:.85rem;transition:color .2s}nav a:hover{color:#fff}.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:6rem 2rem 4rem;position:relative;z-index:1;text-align:center}.tag{display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .9rem;border-radius:50px;background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:#00d4ff;font-size:.75rem;margin-bottom:1.6rem;letter-spacing:.5px}h1{font-size:clamp(2rem,5vw,3.8rem);font-weight:800;color:#fff;line-height:1.1;margin-bottom:1.2rem}h1 span{background:linear-gradient(90deg,#00d4ff,#0088ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.sub{font-size:1rem;color:#4a5a72;max-width:480px;margin:0 auto 2rem;line-height:1.65}.btns{display:flex;gap:.75rem;justify-content:center;flex-wrap:wrap;margin-bottom:2rem}.btn{padding:.7rem 1.6rem;border-radius:6px;font-size:.88rem;font-weight:600;text-decoration:none;transition:all .2s;font-family:inherit;cursor:pointer;border:none}.btn-c{background:linear-gradient(90deg,#00d4ff,#0060ff);color:#000}.btn-c:hover{transform:translateY(-2px)}.btn-g{background:rgba(255,255,255,.04);color:#7888a0;border:1px solid rgba(255,255,255,.08)}.btn-g:hover{border-color:#00d4ff;color:#fff}.features{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}.feat{display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:#3a4a60}.feat::before{content:"✓";color:#00d4ff;font-weight:700}footer{text-align:center;padding:1.5rem;border-top:1px solid rgba(255,255,255,.04);font-size:.75rem;color:#2a3040}@media(max-width:560px){nav ul{display:none}}</style></head><body><div class="orbs"><div class="orb orb1"></div><div class="orb orb2"></div></div><nav><div class="logo">Vortex<span>Host</span></div><ul><li><a href="#">Hosting</a></li><li><a href="#">VPS</a></li><li><a href="#">Domains</a></li><li><a href="#">Support</a></li></ul></nav><section class="hero"><div><div class="tag">⚡ 99.99% Uptime Guaranteed</div><h1>Web hosting that's <span>lightning fast</span></h1><p class="sub">Deploy your projects in seconds with our global CDN, NVMe storage, and auto-scaling infrastructure.</p><div class="btns"><a class="btn btn-c" href="#">Start Free Trial</a><a class="btn btn-g" href="#">View Plans</a></div><div class="features"><span class="feat">Free SSL</span><span class="feat">Daily Backups</span><span class="feat">1-Click Deploy</span><span class="feat">24/7 Support</span></div></div></section><footer>&copy; 2026 VortexHost. All rights reserved.</footer></body></html>
+HTML
+}
+
+create_stub_blog() {
+cat > /var/www/html/index.html << 'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Alex Chen — Engineering Blog</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Georgia',serif;background:#faf8f5;color:#2d2926;line-height:1.7}nav{position:fixed;top:0;width:100%;padding:.9rem 2rem;display:flex;justify-content:space-between;align-items:center;background:#faf8f5;border-bottom:1px solid #e8e3da;z-index:10}.logo{font-size:1rem;font-weight:700;color:#1a1714}nav ul{list-style:none;display:flex;gap:1.5rem}nav a{color:#7a7068;text-decoration:none;font-family:-apple-system,sans-serif;font-size:.82rem;transition:color .2s}nav a:hover{color:#1a1714}.hero{max-width:660px;margin:0 auto;padding:8rem 2rem 4rem;text-align:center}.avatar{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#8b5cf6,#3b82f6);margin:0 auto 1.5rem;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.6rem}h1{font-size:clamp(1.8rem,4vw,2.8rem);color:#1a1714;margin-bottom:.8rem;line-height:1.2;letter-spacing:-.3px}.tagline{font-size:1.05rem;color:#7a7068;max-width:440px;margin:0 auto 2rem}.social{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}.social a{padding:.45rem 1.1rem;border:1px solid #e0dbd2;border-radius:5px;font-family:-apple-system,sans-serif;font-size:.82rem;color:#5a5248;text-decoration:none;transition:all .2s}.social a:hover{border-color:#8b5cf6;color:#8b5cf6}.posts{max-width:660px;margin:0 auto;padding:1rem 2rem 4rem}.section-title{font-family:-apple-system,sans-serif;font-size:.72rem;text-transform:uppercase;letter-spacing:2px;color:#b0a898;margin-bottom:1.2rem;padding-bottom:.5rem;border-bottom:1px solid #e8e3da}.post{padding:1.2rem 0;border-bottom:1px solid #f0ece4;display:flex;justify-content:space-between;align-items:flex-start;gap:1rem}.post:last-child{border-bottom:none}.post-title{font-size:1rem;color:#1a1714;text-decoration:none;transition:color .2s;line-height:1.4}.post-title:hover{color:#8b5cf6}.post-meta{font-family:-apple-system,sans-serif;font-size:.75rem;color:#b0a898;white-space:nowrap}.tags{display:flex;gap:.4rem;margin-top:.35rem;flex-wrap:wrap}.tag{font-family:-apple-system,sans-serif;font-size:.7rem;padding:.15rem .5rem;background:#f0ece4;color:#7a7068;border-radius:3px}footer{text-align:center;padding:1.5rem;border-top:1px solid #e8e3da;font-family:-apple-system,sans-serif;font-size:.75rem;color:#b0a898}@media(max-width:540px){nav ul{display:none}}</style></head><body><nav><div class="logo">Alex Chen</div><ul><li><a href="#">Writing</a></li><li><a href="#">Projects</a></li><li><a href="#">About</a></li><li><a href="#">RSS</a></li></ul></nav><section class="hero"><div class="avatar">✍️</div><h1>Software engineering, systems, and occasional philosophy</h1><p class="tagline">Building distributed systems by day. Writing about technology, craft, and the occasional rabbit hole by night.</p><div class="social"><a href="#">GitHub</a><a href="#">Twitter / X</a><a href="#">LinkedIn</a><a href="#">Newsletter</a></div></section><section class="posts"><div class="section-title">Recent Writing</div><div class="post"><div><a class="post-title" href="#">Why I stopped using ORM frameworks in production</a><div class="tags"><span class="tag">databases</span><span class="tag">backend</span></div></div><span class="post-meta">Feb 2026</span></div><div class="post"><div><a class="post-title" href="#">A practical guide to distributed tracing without vendor lock-in</a><div class="tags"><span class="tag">observability</span></div></div><span class="post-meta">Jan 2026</span></div><div class="post"><div><a class="post-title" href="#">Event sourcing in Go: lessons after two years in production</a><div class="tags"><span class="tag">go</span><span class="tag">architecture</span></div></div><span class="post-meta">Dec 2025</span></div></section><footer>Written and maintained by Alex Chen · No tracking, no cookies</footer></body></html>
+HTML
+}
+
+case "$STUB_CHOICE" in
+    1) create_stub_minimal ;;
+    2) create_stub_cats ;;
+    3) create_stub_business ;;
+    4) create_stub_hosting ;;
+    5) create_stub_blog ;;
 esac
+echo -e "${GREEN}[✓] Stub-страница создана${NC}"
 
-if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "0\.1[45]"; then
-    echo -e "${DIM}[·] Zig $(zig version) уже установлен${NC}"
-else
-    echo -e "${CYAN}[*] Устанавливаю Zig ${ZIG_VERSION}...${NC}"
-    # Новый формат URL: zig-ARCH-OS-VERSION
-    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
-    if ! curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz 2>/dev/null; then
-        # Старый формат: zig-linux-ARCH-VERSION
-        ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
-        if ! curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz 2>/dev/null; then
-            echo -e "${RED}[✗] Не удалось скачать Zig ${ZIG_VERSION}${NC}"
-            echo -e "${YELLOW}    Попробую 0.14.0...${NC}"
-            ZIG_VERSION="0.14.0"
-            ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
-            if ! curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz 2>/dev/null; then
-                ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
-                curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz || {
-                    echo -e "${RED}[✗] Не удалось скачать Zig. Установи вручную: https://ziglang.org/download/${NC}"
-                    exit 1
-                }
-            fi
-        fi
-    fi
-    tar xJf /tmp/zig.tar.xz -C /usr/local
-    # Найти распакованную папку
-    ZIG_DIR=$(ls -d /usr/local/zig-*-linux-${ZIG_VERSION}* 2>/dev/null | head -1)
-    [[ -z "$ZIG_DIR" ]] && ZIG_DIR=$(ls -d /usr/local/zig-linux-*-${ZIG_VERSION}* 2>/dev/null | head -1)
-    [[ -n "$ZIG_DIR" ]] && ln -sf "${ZIG_DIR}/zig" /usr/local/bin/zig
-    rm -f /tmp/zig.tar.xz
-    if zig version &>/dev/null; then
-        echo -e "${GREEN}[✓] Zig $(zig version) установлен${NC}"
-    else
-        echo -e "${RED}[✗] Zig не работает после установки${NC}"
-        exit 1
-    fi
+# ── Останавливаем Caddy если был ───────────────────────────
+if systemctl is-active --quiet caddy 2>/dev/null; then
+    echo -e "${YELLOW}[!] Caddy обнаружен, останавливаю и отключаю...${NC}"
+    systemctl stop caddy
+    systemctl disable caddy > /dev/null 2>&1 || true
 fi
 
-# ── Сборка mtproto.zig ────────────────────────────────────
-echo -e "${CYAN}[*] Собираю mtproto.zig (ReleaseFast)...${NC}"
-PROXY_DIR="/opt/mtproto-proxy"
-BUILD_DIR="/tmp/mtproto-zig-build"
+# ── nginx: начальная конфигурация (HTTP only, для certbot) ─
+echo -e "${CYAN}[*] Настраиваю nginx...${NC}"
 
-rm -rf "$BUILD_DIR"
-if ! git clone -q https://github.com/sleep3r/mtproto.zig.git "$BUILD_DIR" 2>/dev/null; then
-    echo -e "${YELLOW}[!] GitHub недоступен напрямую, пробую proxy...${NC}"
-    if ! git clone -q https://ghproxy.com/https://github.com/sleep3r/mtproto.zig.git "$BUILD_DIR" 2>/dev/null; then
-        echo -e "${RED}[✗] Не удалось скачать mtproto.zig — GitHub заблокирован${NC}"
-        echo -e "${DIM}    Установи VPN или прокси для доступа к GitHub${NC}"
-        exit 1
-    fi
-fi
-cd "$BUILD_DIR"
+# Убираем дефолтный сайт
+rm -f /etc/nginx/sites-enabled/default
 
-if zig build -Doptimize=ReleaseFast 2>&1 | tail -5; then
-    mkdir -p "$PROXY_DIR"
-    cp zig-out/bin/mtproto-proxy "$PROXY_DIR/"
-    BIN_SIZE=$(du -h "$PROXY_DIR/mtproto-proxy" | awk '{print $1}')
-    echo -e "${GREEN}[✓] mtproto.zig собран (${BIN_SIZE})${NC}"
+cat > /etc/nginx/sites-available/selfsteal << NGEOF
+# Временный HTTP — для получения сертификата certbot
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    root /var/www/html;
+    index index.html;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        try_files \$uri /index.html;
+    }
+}
+NGEOF
+
+ln -sf /etc/nginx/sites-available/selfsteal /etc/nginx/sites-enabled/selfsteal
+nginx -t > /dev/null 2>&1 || { echo -e "${RED}[✗] Ошибка конфигурации nginx${NC}"; exit 1; }
+systemctl enable nginx > /dev/null 2>&1
+systemctl restart nginx
+echo -e "${GREEN}[✓] nginx запущен (HTTP)${NC}"
+
+# ── Получаем сертификат через certbot ──────────────────────
+echo -e "${CYAN}[*] Получаю TLS-сертификат (Let's Encrypt)...${NC}"
+certbot certonly --nginx \
+    -d "${DOMAIN}" \
+    --non-interactive \
+    --agree-tos \
+    --register-unsafely-without-email \
+    --quiet 2>/dev/null
+
+CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+
+if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
+    echo -e "${GREEN}[✓] Сертификат получен${NC}"
 else
-    echo -e "${RED}[✗] Сборка не удалась${NC}"
+    echo -e "${RED}[✗] Не удалось получить сертификат!${NC}"
+    echo -e "${YELLOW}    Убедись что порт 80 открыт и DNS ведёт на сервер${NC}"
+    echo -e "${YELLOW}    Попробуй вручную: certbot certonly --nginx -d ${DOMAIN}${NC}"
     exit 1
 fi
 
-# Копируем deploy-скрипты если есть
-[[ -d "${BUILD_DIR}/deploy" ]] && cp -r "${BUILD_DIR}/deploy" "${PROXY_DIR}/"
+# ── nginx: полная конфигурация (HTTP + HTTPS localhost) ────
+cat > /etc/nginx/sites-available/selfsteal << NGEOF
+# Публичный HTTP — страница + ACME challenge для обновления сертификата
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
 
-# ── Пользователь ──────────────────────────────────────────
-if ! id mtproto &>/dev/null; then
-    useradd -r -s /usr/sbin/nologin -d "$PROXY_DIR" mtproto
-fi
+    root /var/www/html;
+    index index.html;
 
-# ── Секрет + config.toml ──────────────────────────────────
-SECRET=$(openssl rand -hex 16)
+    # ACME challenge для certbot
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
 
-cat > "${PROXY_DIR}/config.toml" << TOMLEOF
-[server]
-port = 443
+    location / {
+        try_files \$uri /index.html;
+    }
 
-[censorship]
-tls_domain = "${TLS_DOMAIN}"
-mask = true
-fast_mode = true
+    # Убираем заголовок Server
+    server_tokens off;
+    add_header X-Content-Type-Options "nosniff" always;
+}
 
-[access.users]
-tg = "${SECRET}"
-TOMLEOF
+# Внутренний HTTPS — маскировка для mtprotoproxy (ТОЛЬКО localhost)
+# DPI/сканер → mtprotoproxy → сюда → видит валидный TLS 1.3 + HTML
+server {
+    listen 127.0.0.1:8443 ssl;
+    server_name ${DOMAIN};
 
-chown -R mtproto:mtproto "$PROXY_DIR"
-echo -e "${GREEN}[✓] config.toml создан (секрет: 16 случайных байт)${NC}"
+    ssl_certificate     ${CERT_PATH};
+    ssl_certificate_key ${KEY_PATH};
 
-# ── systemd ───────────────────────────────────────────────
-echo -e "${CYAN}[*] Создаю systemd-юнит...${NC}"
-if [[ -f "${BUILD_DIR}/deploy/mtproto-proxy.service" ]]; then
-    cp "${BUILD_DIR}/deploy/mtproto-proxy.service" /etc/systemd/system/
-else
-    cat > /etc/systemd/system/mtproto-proxy.service << 'SVCEOF'
+    # Строго TLS 1.3 — чистый хендшейк без лишних записей
+    ssl_protocols       TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    root /var/www/html;
+    index index.html;
+
+    location / {
+        try_files \$uri /index.html;
+    }
+
+    server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+NGEOF
+
+nginx -t > /dev/null 2>&1 || { echo -e "${RED}[✗] Ошибка конфигурации nginx${NC}"; exit 1; }
+systemctl reload nginx
+echo -e "${GREEN}[✓] nginx настроен (HTTP + HTTPS localhost)${NC}"
+
+# ── Автообновление сертификата ─────────────────────────────
+# certbot ставит cron/timer автоматически, но добавим перезапуск mtprotoproxy
+cat > /etc/letsencrypt/renewal-hooks/post/restart-services.sh << 'HOOKEOF'
+#!/bin/bash
+systemctl reload nginx
+systemctl restart mtprotoproxy
+HOOKEOF
+chmod +x /etc/letsencrypt/renewal-hooks/post/restart-services.sh
+echo -e "${GREEN}[✓] Автообновление сертификата настроено${NC}"
+
+# ── Конфиг mtprotoproxy ────────────────────────────────────
+cat > "${PROXY_DIR}/config.py" << PYEOF
+# ── MTProto SelfSteal Config v3 ─────────────────────────────
+# Сгенерировано selfsteal-mtproto-setup.sh v3
+
+# Порт прокси (443 = максимальная скрытность)
+PORT = 443
+
+# Пользователи и их секреты
+# ВАЖНО: в USERS — только 32 hex символа (сырой ключ)
+# Клиент получает полный секрет: ee + ключ + домен_hex
+USERS = {
+    "user1": "${RANDOM_KEY}",
+}
+
+# Домен маскировки
+TLS_DOMAIN = "${DOMAIN}"
+
+# SelfSteal: маскировка под свой сайт
+# DPI/сканер → mtprotoproxy → nginx:8443 (TLS 1.3 + реальная HTML-страница)
+MASK = True
+MASK_HOST = "127.0.0.1"
+MASK_PORT = 8443
+PYEOF
+
+echo -e "${GREEN}[✓] Конфиг mtprotoproxy создан${NC}"
+
+# ── systemd: mtprotoproxy ──────────────────────────────────
+echo -e "${CYAN}[*] Создаю systemd-юнит для mtprotoproxy...${NC}"
+cat > /etc/systemd/system/mtprotoproxy.service << SVCEOF
 [Unit]
-Description=MTProto Proxy (mtproto.zig)
-After=network.target
+Description=MTProto Proxy for Telegram (SelfSteal)
+After=network.target nginx.service
+Requires=nginx.service
 
 [Service]
 Type=simple
-User=mtproto
-Group=mtproto
-WorkingDirectory=/opt/mtproto-proxy
-ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+User=root
+WorkingDirectory=${PROXY_DIR}
+ExecStart=/usr/bin/python3 ${PROXY_DIR}/mtprotoproxy.py
 Restart=always
-RestartSec=3
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/mtproto-proxy
-PrivateTmp=true
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-fi
 
 systemctl daemon-reload
 echo -e "${GREEN}[✓] Юнит создан${NC}"
 
-# ── TCPMSS=88 ─────────────────────────────────────────────
-echo -e "${CYAN}[*] Применяю TCPMSS=88...${NC}"
-IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
-IFACE=${IFACE:-eth0}
-
-iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o "$IFACE" \
-    --dport 443 -j TCPMSS --set-mss 88 2>/dev/null || true
-iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o "$IFACE" \
-    --dport 443 -j TCPMSS --set-mss 88
-
-# Persist
-if command -v netfilter-persistent &>/dev/null; then
-    netfilter-persistent save > /dev/null 2>&1 || true
-else
-    iptables-save > /etc/iptables.rules 2>/dev/null || true
-    grep -q "iptables-restore" /etc/rc.local 2>/dev/null || {
-        printf '#!/bin/bash\niptables-restore < /etc/iptables.rules\n' > /etc/rc.local
-        chmod +x /etc/rc.local
-    }
-fi
-echo -e "${GREEN}[✓] TCPMSS=88 на ${IFACE} — ClientHello фрагментация${NC}"
-
-# ── zapret/nfqws ──────────────────────────────────────────
-if [[ "$INSTALL_ZAPRET" == "y" ]]; then
-    set +e  # zapret — опционален, не убиваем скрипт при ошибке
-    echo -e "${CYAN}[*] Устанавливаю zapret/nfqws...${NC}"
-    ZAPRET_DIR="/opt/zapret"
-
-    if [[ -d "$ZAPRET_DIR" ]]; then
-        git -C "$ZAPRET_DIR" pull -q 2>/dev/null || true
-    else
-        # GitHub может быть заблокирован — пробуем несколько способов
-        if ! git clone -q https://github.com/bol-van/zapret.git "$ZAPRET_DIR" 2>/dev/null; then
-            echo -e "${YELLOW}[!] GitHub недоступен, пробую через proxy...${NC}"
-            if ! git clone -q https://ghproxy.com/https://github.com/bol-van/zapret.git "$ZAPRET_DIR" 2>/dev/null; then
-                echo -e "${RED}[✗] Не удалось скачать zapret — GitHub заблокирован${NC}"
-                echo -e "${DIM}    Скачай вручную и положи в /opt/zapret/${NC}"
-                echo -e "${DIM}    Или используй VPN/прокси для git${NC}"
-                INSTALL_ZAPRET="n"
-            fi
-        fi
-    fi
-
-    cd "$ZAPRET_DIR"
-    if make -j"$(nproc)" > /dev/null 2>&1 && [[ -x "${ZAPRET_DIR}/nfq/nfqws" ]]; then
-
-        cat > /etc/systemd/system/nfqws-mtproto.service << NFQEOF
-[Unit]
-Description=nfqws DPI desync for MTProto
-After=network.target
-Before=mtproto-proxy.service
-
-[Service]
-Type=simple
-ExecStart=${ZAPRET_DIR}/nfq/nfqws \\
-    --qnum=200 \\
-    --dpi-desync=fake,disorder2 \\
-    --dpi-desync-split-pos=1 \\
-    --dpi-desync-ttl=6 \\
-    --dpi-desync-fooling=md5sig,badsum \\
-    --dpi-desync-fake-tls=${ZAPRET_DIR}/files/fake/tls_clienthello_www_google_com.bin
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-NFQEOF
-
-        # NFQUEUE iptables rule
-        iptables -t mangle -D POSTROUTING -o "$IFACE" -p tcp --dport 443 \
-            -m connbytes --connbytes-dir=original --connbytes-mode=packets --connbytes 1:6 \
-            -m mark ! --mark 0x40000000/0x40000000 \
-            -j NFQUEUE --queue-num 200 --queue-bypass 2>/dev/null || true
-
-        iptables -t mangle -A POSTROUTING -o "$IFACE" -p tcp --dport 443 \
-            -m connbytes --connbytes-dir=original --connbytes-mode=packets --connbytes 1:6 \
-            -m mark ! --mark 0x40000000/0x40000000 \
-            -j NFQUEUE --queue-num 200 --queue-bypass
-
-        # Persist
-        if command -v netfilter-persistent &>/dev/null; then
-            netfilter-persistent save > /dev/null 2>&1 || true
-        else
-            iptables-save > /etc/iptables.rules 2>/dev/null || true
-        fi
-
-        systemctl daemon-reload
-        systemctl enable nfqws-mtproto > /dev/null 2>&1
-        systemctl start nfqws-mtproto
-        echo -e "${GREEN}[✓] zapret/nfqws запущен${NC}"
-        echo -e "${DIM}    Стратегия: fake,disorder2 + ttl=6 + md5sig,badsum${NC}"
-        echo -e "${DIM}    Тонкая настройка: cd /opt/zapret && ./blockcheck.sh${NC}"
-    else
-        echo -e "${YELLOW}[!] zapret не собрался — пропускаю nfqws${NC}"
-        INSTALL_ZAPRET="n"
-    fi
-fi
-
-# ── fail2ban ──────────────────────────────────────────────
-set -e  # обратно включаем строгий режим
-cat > /etc/fail2ban/jail.d/selfsteal.conf << 'F2B'
-[sshd]
-enabled = true
-maxretry = 5
-bantime = 3600
-findtime = 600
-F2B
-systemctl enable fail2ban > /dev/null 2>&1
-systemctl restart fail2ban > /dev/null 2>&1
-echo -e "${GREEN}[✓] fail2ban настроен${NC}"
-
-# ── UFW ───────────────────────────────────────────────────
+# ── Файрвол ────────────────────────────────────────────────
+echo -e "${CYAN}[*] Настраиваю файрвол...${NC}"
 if command -v ufw &>/dev/null; then
-    ufw allow 80/tcp  > /dev/null 2>&1 || true
-    ufw allow 443/tcp > /dev/null 2>&1 || true
-    echo -e "${GREEN}[✓] UFW: 80, 443 открыты${NC}"
+    ufw allow 80/tcp   > /dev/null 2>&1 || true
+    ufw allow 443/tcp  > /dev/null 2>&1 || true
+    ufw delete allow 8443/tcp > /dev/null 2>&1 || true
+    echo -e "${GREEN}[✓] UFW: 80, 443 открыты | 8443 только localhost${NC}"
 fi
 
-# ── Запуск ─────────────────────────────────────────────────
-echo -e "${CYAN}[*] Запускаю mtproto-proxy...${NC}"
-systemctl enable mtproto-proxy > /dev/null 2>&1
-systemctl restart mtproto-proxy
-sleep 2
+# ── Запуск mtprotoproxy ────────────────────────────────────
+echo -e "${CYAN}[*] Запускаю mtprotoproxy...${NC}"
+systemctl enable mtprotoproxy > /dev/null 2>&1
+systemctl restart mtprotoproxy
+sleep 3
 
-if systemctl is-active --quiet mtproto-proxy; then
-    echo -e "${GREEN}[✓] mtproto-proxy запущен${NC}"
+if systemctl is-active --quiet mtprotoproxy; then
+    echo -e "${GREEN}[✓] mtprotoproxy запущен${NC}"
 else
-    echo -e "${RED}[✗] mtproto-proxy не запустился:${NC}"
-    journalctl -u mtproto-proxy -n 10 --no-pager
+    echo -e "${RED}[✗] mtprotoproxy не запустился!${NC}"
+    echo -e "${YELLOW}    Проверь: journalctl -u mtprotoproxy -n 30${NC}"
 fi
 
-# ── Очистка ────────────────────────────────────────────────
-rm -rf "$BUILD_DIR"
+# ── Проверка логов ────────────────────────────────────────
+PROXY_LOG=$(journalctl -u mtprotoproxy --no-pager -n 10 2>/dev/null)
 
-# ── Ссылка ─────────────────────────────────────────────────
-HEX_DOMAIN=$(python3 -c "print('${TLS_DOMAIN}'.encode().hex())" 2>/dev/null || echo -n "${TLS_DOMAIN}" | od -A n -t x1 | tr -d ' \n')
-FULL_SECRET="ee${SECRET}${HEX_DOMAIN}"
-TG_LINK="https://t.me/proxy?server=${DOMAIN}&port=443&secret=${FULL_SECRET}"
+if echo "$PROXY_LOG" | grep -q "Bad secret"; then
+    echo -e "${RED}[✗] Ошибка секрета — проверь journalctl -u mtprotoproxy${NC}"
+elif echo "$PROXY_LOG" | grep -q "TLS record before certificate"; then
+    echo -e "${YELLOW}[!] Предупреждение: TLS record before certificate (некритично)${NC}"
+fi
+
+if echo "$PROXY_LOG" | grep -q "Got cert from the MASK_HOST"; then
+    echo -e "${GREEN}[✓] Маскировка работает — сертификат получен от nginx${NC}"
+fi
+
+# ── Ссылка для подключения ────────────────────────────────
+TG_LINK="https://t.me/proxy?server=${DOMAIN}&port=443&secret=${FAKETLS_SECRET}"
 
 # ── Итог ───────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║         ✓  MTPSSteal v5 готов!                           ║${NC}"
-echo -e "${GREEN}║         mtproto.zig + полная DPI-защита                  ║${NC}"
+echo -e "${GREEN}║         ✓  MTProto SelfSteal v3 готов!                   ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}Домен:${NC}          ${CYAN}${DOMAIN}${NC}"
 echo -e "  ${BOLD}IP сервера:${NC}     ${CYAN}${SERVER_IP}${NC}"
-echo -e "  ${BOLD}Маскировка:${NC}     ${CYAN}${TLS_DOMAIN}${NC}"
-echo -e "  ${BOLD}Прокси:${NC}         ${CYAN}mtproto.zig (Zig, ReleaseFast)${NC}"
+echo -e "  ${BOLD}Маскировка:${NC}     ${CYAN}${STUB_NAMES[$((STUB_CHOICE-1))]}${NC}"
+echo -e "  ${BOLD}Веб-сервер:${NC}     ${CYAN}nginx + certbot${NC}"
 echo ""
-echo -e "  ${YELLOW}━━  Ссылка для Telegram  ━━${NC}"
+echo -e "  ${YELLOW}━━━  Ссылка для Telegram  ━━━${NC}"
 echo ""
 echo -e "  ${GREEN}${TG_LINK}${NC}"
 echo ""
-echo -e "  ${BOLD}Секрет:${NC} ${CYAN}${FULL_SECRET}${NC}"
+echo -e "  ${DIM}Скопируй ссылку → отправь в Saved Messages → нажми → Подключить${NC}"
 echo ""
-echo -e "  ${YELLOW}━━  DPI-защита  ━━${NC}"
+echo -e "  ${BOLD}Секрет (faketls):${NC}"
+echo -e "  ${CYAN}${FAKETLS_SECRET}${NC}"
 echo ""
-echo -e "  ${GREEN}✓${NC} FakeTLS 1.3 — трафик = обычный HTTPS"
-echo -e "  ${GREEN}✓${NC} TCPMSS=88 — ClientHello → 6 TCP-фрагментов"
-echo -e "  ${GREEN}✓${NC} Split-TLS — 1-байтный чанкинг"
-echo -e "  ${GREEN}✓${NC} DRS — имитация Chrome/Firefox"
-echo -e "  ${GREEN}✓${NC} Anti-replay — блокировка ТСПУ Ревизор проб"
-echo -e "  ${GREEN}✓${NC} Маскировка → ${TLS_DOMAIN}"
-[[ "$INSTALL_ZAPRET" == "y" ]] && \
-echo -e "  ${GREEN}✓${NC} zapret/nfqws — TCP desync + TTL spoofing"
+echo -e "  ${YELLOW}━━━  Порты  ━━━${NC}"
 echo ""
-echo -e "  ${YELLOW}━━  Управление  ━━${NC}"
+echo -e "  ${BOLD}443${NC}   → mtprotoproxy (MTProto + FakeTLS маскировка)"
+echo -e "  ${BOLD}80${NC}    → nginx (HTML-страница + ACME challenge)"
+echo -e "  ${BOLD}8443${NC}  → nginx HTTPS (только 127.0.0.1 — TLS 1.3 для DPI)"
 echo ""
-echo -e "  ${DIM}journalctl -u mtproto-proxy -f${NC}     — логи прокси"
-echo -e "  ${DIM}systemctl restart mtproto-proxy${NC}     — перезапуск"
-echo -e "  ${DIM}nano ${PROXY_DIR}/config.toml${NC}       — конфиг"
-[[ "$INSTALL_ZAPRET" == "y" ]] && \
-echo -e "  ${DIM}cd /opt/zapret && ./blockcheck.sh${NC}   — подбор стратегии nfqws"
+echo -e "  ${YELLOW}━━━  Управление  ━━━${NC}"
+echo ""
+echo -e "  ${DIM}Логи прокси:     journalctl -u mtprotoproxy -f${NC}"
+echo -e "  ${DIM}Логи nginx:      journalctl -u nginx -f  /  tail -f /var/log/nginx/error.log${NC}"
+echo -e "  ${DIM}Тест маскировки: curl -sk https://127.0.0.1:8443 | head -5${NC}"
+echo -e "  ${DIM}Тест сертификата: certbot certificates${NC}"
+echo -e "  ${DIM}Страница:        nano /var/www/html/index.html && systemctl reload nginx${NC}"
+echo ""
+echo -e "  ${YELLOW}━━━  Как работает маскировка  ━━━${NC}"
+echo ""
+echo -e "  Клиент Telegram → :443 → mtprotoproxy → MTProto ОК → туннель в Telegram"
+echo -e "  DPI/сканер       → :443 → mtprotoproxy → не MTProto → nginx:8443 (TLS 1.3 + HTML)"
+echo -e "  Браузер          → :80  → nginx (HTML-страница)"
 echo ""
