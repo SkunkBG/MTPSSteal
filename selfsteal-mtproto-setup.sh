@@ -100,7 +100,7 @@ echo -e "${GREEN}[✓] Старый прокси остановлен${NC}"
 # ── Зависимости ───────────────────────────────────────────
 echo -e "${CYAN}[*] Устанавливаю зависимости...${NC}"
 apt update -qq > /dev/null 2>&1
-apt install -y git curl dnsutils ufw fail2ban xz-utils build-essential openssl > /dev/null 2>&1
+apt install -y git curl dnsutils ufw fail2ban xz-utils build-essential openssl python3 > /dev/null 2>&1
 echo -e "${GREEN}[✓] Зависимости установлены${NC}"
 
 # ── Zig ───────────────────────────────────────────────────
@@ -112,14 +112,41 @@ case "$ARCH" in
     *) echo -e "${RED}[✗] Неподдерживаемая архитектура: ${ARCH}${NC}"; exit 1 ;;
 esac
 
-if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
-    echo -e "${DIM}[·] Zig ${ZIG_VERSION} уже установлен${NC}"
+if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "0\.1[45]"; then
+    echo -e "${DIM}[·] Zig $(zig version) уже установлен${NC}"
 else
     echo -e "${CYAN}[*] Устанавливаю Zig ${ZIG_VERSION}...${NC}"
-    curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" \
-        | tar xJ -C /usr/local
-    ln -sf "/usr/local/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
-    echo -e "${GREEN}[✓] Zig $(zig version) установлен${NC}"
+    # Новый формат URL: zig-ARCH-OS-VERSION
+    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+    if ! curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz 2>/dev/null; then
+        # Старый формат: zig-linux-ARCH-VERSION
+        ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+        if ! curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz 2>/dev/null; then
+            echo -e "${RED}[✗] Не удалось скачать Zig ${ZIG_VERSION}${NC}"
+            echo -e "${YELLOW}    Попробую 0.14.0...${NC}"
+            ZIG_VERSION="0.14.0"
+            ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+            if ! curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz 2>/dev/null; then
+                ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+                curl -sSfL "$ZIG_URL" -o /tmp/zig.tar.xz || {
+                    echo -e "${RED}[✗] Не удалось скачать Zig. Установи вручную: https://ziglang.org/download/${NC}"
+                    exit 1
+                }
+            fi
+        fi
+    fi
+    tar xJf /tmp/zig.tar.xz -C /usr/local
+    # Найти распакованную папку
+    ZIG_DIR=$(ls -d /usr/local/zig-*-linux-${ZIG_VERSION}* 2>/dev/null | head -1)
+    [[ -z "$ZIG_DIR" ]] && ZIG_DIR=$(ls -d /usr/local/zig-linux-*-${ZIG_VERSION}* 2>/dev/null | head -1)
+    [[ -n "$ZIG_DIR" ]] && ln -sf "${ZIG_DIR}/zig" /usr/local/bin/zig
+    rm -f /tmp/zig.tar.xz
+    if zig version &>/dev/null; then
+        echo -e "${GREEN}[✓] Zig $(zig version) установлен${NC}"
+    else
+        echo -e "${RED}[✗] Zig не работает после установки${NC}"
+        exit 1
+    fi
 fi
 
 # ── Сборка mtproto.zig ────────────────────────────────────
